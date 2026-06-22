@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.async {
             self.configureStatusItem()
+            MalangiSettings.refreshRemoteRegistrations()
             self.showOverlay()
         }
     }
@@ -65,9 +66,17 @@ struct Malangi {
 }
 
 struct StoredMalangi: Codable {
+    let remoteId: String?
     let name: String
     let imagePath: String
     let soundPaths: [String]
+
+    init(remoteId: String? = nil, name: String, imagePath: String, soundPaths: [String]) {
+        self.remoteId = remoteId
+        self.name = name
+        self.imagePath = imagePath
+        self.soundPaths = soundPaths
+    }
 
     func asMalangi() -> Malangi {
         Malangi(
@@ -79,6 +88,194 @@ struct StoredMalangi: Codable {
             imageName: imagePath,
             soundNames: soundPaths
         )
+    }
+}
+
+struct SupabaseMalangiRow: Codable {
+    let id: String
+    let name: String
+    let imagePath: String
+    let soundPaths: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case imagePath = "image_path"
+        case soundPaths = "sound_paths"
+    }
+
+    var storedMalangi: StoredMalangi {
+        StoredMalangi(remoteId: id, name: name, imagePath: imagePath, soundPaths: soundPaths)
+    }
+}
+
+struct SupabaseMalangiPayload: Codable {
+    let name: String
+    let imagePath: String
+    let soundPaths: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case imagePath = "image_path"
+        case soundPaths = "sound_paths"
+    }
+}
+
+final class SupabaseMalangiClient {
+    static let shared = SupabaseMalangiClient()
+    static let assetBucket = "malangi-assets"
+
+    private let baseURL: URL?
+    private let publishableKey: String?
+    private let session: URLSession
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    private var isConfigured: Bool {
+        baseURL != nil && publishableKey?.isEmpty == false
+    }
+
+    var canSync: Bool {
+        isConfigured
+    }
+
+    private init(session: URLSession = .shared) {
+        let environment = ProcessInfo.processInfo.environment
+        let urlString = environment["SUPABASE_URL"] ?? ""
+        let key = environment["SUPABASE_PUBLISHABLE_KEY"]
+            ?? environment["SUPABASE_ANON_KEY"]
+            ?? ""
+
+        self.baseURL = URL(string: urlString)
+        self.publishableKey = key
+        self.session = session
+    }
+
+    func fetchAll() throws -> [StoredMalangi] {
+        guard isConfigured else { return [] }
+
+        var request = try makeRequest(path: "/rest/v1/malangis", queryItems: [
+            URLQueryItem(name: "select", value: "id,name,image_path,sound_paths"),
+            URLQueryItem(name: "order", value: "created_at.asc")
+        ])
+        request.httpMethod = "GET"
+
+        let rows: [SupabaseMalangiRow] = try perform(request)
+        return rows.map(\.storedMalangi)
+    }
+
+    func upsert(_ malangi: StoredMalangi) throws -> StoredMalangi {
+        guard isConfigured else { return malangi }
+
+        let payload = SupabaseMalangiPayload(
+            name: malangi.name,
+            imagePath: malangi.imagePath,
+            soundPaths: malangi.soundPaths
+        )
+
+        var queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "select", value: "id,name,image_path,sound_paths")
+        ]
+        if let remoteId = malangi.remoteId {
+            queryItems.append(URLQueryItem(name: "id", value: "eq.\(remoteId)"))
+        }
+
+        var request = try makeRequest(path: "/rest/v1/malangis", queryItems: queryItems)
+        request.httpMethod = malangi.remoteId == nil ? "POST" : "PATCH"
+        request.httpBody = try encoder.encode(payload)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("return=representation", forHTTPHeaderField: "Prefer")
+
+        let rows: [SupabaseMalangiRow] = try perform(request)
+        return rows.first?.storedMalangi ?? malangi
+    }
+
+    func delete(id: String) throws {
+        guard isConfigured else { return }
+
+        var request = try makeRequest(path: "/rest/v1/malangis", queryItems: [
+            URLQueryItem(name: "id", value: "eq.\(id)")
+        ])
+        request.httpMethod = "DELETE"
+        _ = try performRaw(request)
+    }
+
+    func uploadAsset(fileURL: URL, objectPath: String, contentType: String) throws -> String {
+        guard isConfigured else { return fileURL.path }
+
+        var request = try makeRequest(path: "/storage/v1/object/\(Self.assetBucket)/\(objectPath)")
+        request.httpMethod = "POST"
+        request.httpBody = try Data(contentsOf: fileURL)
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue("true", forHTTPHeaderField: "x-upsert")
+        _ = try performRaw(request)
+
+        return try publicAssetURL(objectPath: objectPath).absoluteString
+    }
+
+    func publicAssetURL(objectPath: String) throws -> URL {
+        guard let baseURL else {
+            throw NSError(domain: "Wazak", code: 12, userInfo: [NSLocalizedDescriptionKey: "Supabase URL이 설정되지 않았어요."])
+        }
+
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.path = "/storage/v1/object/public/\(Self.assetBucket)/\(objectPath)"
+
+        guard let url = components?.url else {
+            throw NSError(domain: "Wazak", code: 13, userInfo: [NSLocalizedDescriptionKey: "Supabase Storage URL을 만들 수 없어요."])
+        }
+
+        return url
+    }
+
+    private func makeRequest(path: String, queryItems: [URLQueryItem] = []) throws -> URLRequest {
+        guard let baseURL, let publishableKey else {
+            throw NSError(domain: "Wazak", code: 10, userInfo: [NSLocalizedDescriptionKey: "Supabase 환경변수가 설정되지 않았어요."])
+        }
+
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.path = path
+        components?.queryItems = queryItems.isEmpty ? nil : queryItems
+
+        guard let url = components?.url else {
+            throw NSError(domain: "Wazak", code: 11, userInfo: [NSLocalizedDescriptionKey: "Supabase URL을 만들 수 없어요."])
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 12
+        request.setValue(publishableKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(publishableKey)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    private func perform<T: Decodable>(_ request: URLRequest) throws -> T {
+        let data = try performRaw(request)
+        return try decoder.decode(T.self, from: data)
+    }
+
+    private func performRaw(_ request: URLRequest) throws -> Data {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<(Data, URLResponse), Error>?
+
+        session.dataTask(with: request) { data, response, error in
+            if let error {
+                result = .failure(error)
+            } else {
+                result = .success((data ?? Data(), response ?? URLResponse()))
+            }
+            semaphore.signal()
+        }.resume()
+
+        semaphore.wait()
+
+        let (data, response) = try result?.get() ?? (Data(), URLResponse())
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Supabase 요청에 실패했어요."
+            throw NSError(domain: "Wazak", code: statusCode, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        return data
     }
 }
 
@@ -168,7 +365,10 @@ final class MalangiOverlayView: NSView {
     private var isHovering = false
 
     private var malangis: [Malangi] {
-        defaultMalangis + MalangiSettings.registeredMalangis
+        let registered = MalangiSettings.registeredMalangis
+        let registeredNames = Set(registered.map(\.name))
+        let visibleDefaults = defaultMalangis.filter { !registeredNames.contains($0.name) }
+        return visibleDefaults + registered
     }
 
     override init(frame frameRect: NSRect) {
@@ -361,8 +561,7 @@ final class MalangiImageView: NSView {
         guard let malangi else { return }
 
         if let imageName = malangi.imageName,
-           let imageURL = ResourceLocator.url(for: imageName),
-           let image = NSImage(contentsOf: imageURL) {
+           let image = ResourceLocator.image(for: imageName) {
             image.draw(in: image.aspectFitRect(in: bounds))
             return
         }
@@ -595,16 +794,17 @@ enum MalangiSettings {
     private static let imagePathKey = "malangi.imagePath"
     private static let soundPathsKey = "malangi.soundPaths"
     private static let registeredMalangisKey = "malangi.registeredMalangis"
+    private static let remoteMalangisKey = "malangi.remoteMalangis"
     private static let didMigrateLegacyKey = "malangi.didMigrateLegacy"
 
     static var registeredMalangis: [Malangi] {
         migrateLegacyRegistrationIfNeeded()
-        return storedMalangis.map { $0.asMalangi() }
+        return mergedRegistrations.map { $0.asMalangi() }
     }
 
     static var registrations: [StoredMalangi] {
         migrateLegacyRegistrationIfNeeded()
-        return storedMalangis
+        return mergedRegistrations
     }
 
     static var supportDirectory: URL {
@@ -616,25 +816,26 @@ enum MalangiSettings {
 
     static func saveMalangi(name: String, editingIndex: Int?, image sourceURL: URL?, sounds sourceURLs: [URL]?) throws {
         var stored = storedMalangis
-        let existing = editingIndex.flatMap { stored.indices.contains($0) ? stored[$0] : nil }
-        let registrationDirectory: URL
-
-        if let existing {
-            registrationDirectory = URL(fileURLWithPath: existing.imagePath)
-                .deletingLastPathComponent()
-        } else {
-            registrationDirectory = supportDirectory
-                .appendingPathComponent("Registered", isDirectory: true)
-                .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        }
+        let existing = editingIndex.flatMap { registrations.indices.contains($0) ? registrations[$0] : nil }
+        let assetFolder = existing?.remoteId ?? UUID().uuidString
+        let registrationDirectory = localRegistrationDirectory(for: existing, fallbackFolder: assetFolder)
 
         try FileManager.default.createDirectory(at: registrationDirectory, withIntermediateDirectories: true)
 
+        let storageClient = SupabaseMalangiClient.shared
         let imagePath: String
         if let sourceURL {
             let outputURL = registrationDirectory.appendingPathComponent("malangi.png")
             try BackgroundRemover.writeTransparentPNG(from: sourceURL, to: outputURL)
-            imagePath = outputURL.path
+            if storageClient.canSync {
+                imagePath = try storageClient.uploadAsset(
+                    fileURL: outputURL,
+                    objectPath: "malangis/\(assetFolder)/image.png",
+                    contentType: "image/png"
+                )
+            } else {
+                imagePath = outputURL.path
+            }
         } else if let existing {
             imagePath = existing.imagePath
         } else {
@@ -643,20 +844,25 @@ enum MalangiSettings {
 
         let soundPaths: [String]
         if let sourceURLs {
-            soundPaths = try saveSounds(sourceURLs, in: registrationDirectory)
+            soundPaths = try saveSounds(sourceURLs, in: registrationDirectory, assetFolder: assetFolder)
         } else {
             soundPaths = existing?.soundPaths ?? []
         }
 
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let storedMalangi = StoredMalangi(
+        var storedMalangi = StoredMalangi(
+            remoteId: existing?.remoteId,
             name: trimmedName.isEmpty ? "말랑이 \(stored.count + 1)" : trimmedName,
             imagePath: imagePath,
             soundPaths: soundPaths
         )
 
-        if let editingIndex, stored.indices.contains(editingIndex) {
-            stored[editingIndex] = storedMalangi
+        if let remoteMalangi = try? SupabaseMalangiClient.shared.upsert(storedMalangi) {
+            storedMalangi = remoteMalangi
+        }
+
+        if let localIndex = localIndex(for: existing, in: stored) {
+            stored[localIndex] = storedMalangi
         } else {
             stored.append(storedMalangi)
         }
@@ -667,25 +873,54 @@ enum MalangiSettings {
 
     static func deleteMalangi(at index: Int) throws {
         var stored = storedMalangis
-        guard stored.indices.contains(index) else { return }
+        let allRegistrations = registrations
+        guard allRegistrations.indices.contains(index) else { return }
 
-        let removed = stored.remove(at: index)
-        let directory = URL(fileURLWithPath: removed.imagePath).deletingLastPathComponent()
-        if FileManager.default.fileExists(atPath: directory.path) {
-            try? FileManager.default.removeItem(at: directory)
+        let removed = allRegistrations[index]
+        if let remoteId = removed.remoteId {
+            try? SupabaseMalangiClient.shared.delete(id: remoteId)
+        }
+
+        if let localIndex = localIndex(for: removed, in: stored) {
+            stored.remove(at: localIndex)
+        }
+
+        if ResourceLocator.isLocalFileReference(removed.imagePath) {
+            let directory = URL(fileURLWithPath: removed.imagePath).deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: directory.path) {
+                try? FileManager.default.removeItem(at: directory)
+            }
         }
 
         saveStoredMalangis(stored)
+        refreshRemoteRegistrations()
         notifyChanged()
     }
 
+    static func refreshRemoteRegistrations() {
+        DispatchQueue.global(qos: .utility).async {
+            guard let remoteMalangis = try? SupabaseMalangiClient.shared.fetchAll() else {
+                return
+            }
+
+            saveRemoteMalangis(remoteMalangis)
+            notifyChanged()
+        }
+    }
+
     private static func saveSounds(_ sourceURLs: [URL], in registrationDirectory: URL) throws -> [String] {
+        try saveSounds(sourceURLs, in: registrationDirectory, assetFolder: UUID().uuidString)
+    }
+
+    private static func saveSounds(_ sourceURLs: [URL], in registrationDirectory: URL, assetFolder: String) throws -> [String] {
         let soundDirectory = registrationDirectory.appendingPathComponent("Sounds", isDirectory: true)
         let temporaryDirectory = registrationDirectory
             .appendingPathComponent("TempSounds-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
 
-        let stagedURLs = try sourceURLs.enumerated().map { index, sourceURL in
+        let remoteURLs = sourceURLs.filter { !$0.isFileURL }.map(\.absoluteString)
+        let localSourceURLs = sourceURLs.filter(\.isFileURL)
+        let stagedURLs = try localSourceURLs.enumerated().map { index, sourceURL in
             let extensionName = sourceURL.pathExtension.isEmpty ? "mp3" : sourceURL.pathExtension
             let fileName = "sound-\(index + 1).\(extensionName)"
             let stagedURL = temporaryDirectory.appendingPathComponent(fileName)
@@ -698,15 +933,53 @@ enum MalangiSettings {
         }
         try FileManager.default.createDirectory(at: soundDirectory, withIntermediateDirectories: true)
 
+        let storageClient = SupabaseMalangiClient.shared
         let savedPaths = try stagedURLs.enumerated().map { index, stagedURL in
             let fileName = stagedURL.lastPathComponent
             let destinationURL = soundDirectory.appendingPathComponent(fileName)
             try FileManager.default.moveItem(at: stagedURL, to: destinationURL)
+            if storageClient.canSync {
+                return try storageClient.uploadAsset(
+                    fileURL: destinationURL,
+                    objectPath: "malangis/\(assetFolder)/sounds/\(fileName)",
+                    contentType: contentType(for: destinationURL)
+                )
+            }
             return destinationURL.path
         }
 
         try? FileManager.default.removeItem(at: temporaryDirectory)
-        return savedPaths
+        return remoteURLs + savedPaths
+    }
+
+    private static func localRegistrationDirectory(for existing: StoredMalangi?, fallbackFolder: String) -> URL {
+        if let existing,
+           ResourceLocator.isLocalFileReference(existing.imagePath) {
+            return URL(fileURLWithPath: existing.imagePath).deletingLastPathComponent()
+        }
+
+        return supportDirectory
+            .appendingPathComponent("Registered", isDirectory: true)
+            .appendingPathComponent(fallbackFolder, isDirectory: true)
+    }
+
+    private static func contentType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "png":
+            return "image/png"
+        case "jpg", "jpeg":
+            return "image/jpeg"
+        case "webp":
+            return "image/webp"
+        case "m4a":
+            return "audio/mp4"
+        case "wav":
+            return "audio/wav"
+        case "aif", "aiff":
+            return "audio/aiff"
+        default:
+            return "audio/mpeg"
+        }
     }
 
     private static var storedMalangis: [StoredMalangi] {
@@ -717,9 +990,46 @@ enum MalangiSettings {
         return (try? JSONDecoder().decode([StoredMalangi].self, from: data)) ?? []
     }
 
+    private static var remoteMalangis: [StoredMalangi] {
+        guard let data = UserDefaults.standard.data(forKey: remoteMalangisKey) else {
+            return []
+        }
+
+        return (try? JSONDecoder().decode([StoredMalangi].self, from: data)) ?? []
+    }
+
+    private static var mergedRegistrations: [StoredMalangi] {
+        let local = storedMalangis
+        let localRemoteIds = Set(local.compactMap(\.remoteId))
+        let localImagePaths = Set(local.map(\.imagePath))
+        let remoteOnly = remoteMalangis.filter { remote in
+            if let remoteId = remote.remoteId {
+                return !localRemoteIds.contains(remoteId)
+            }
+            return !localImagePaths.contains(remote.imagePath)
+        }
+
+        return local + remoteOnly
+    }
+
+    private static func localIndex(for malangi: StoredMalangi?, in stored: [StoredMalangi]) -> Int? {
+        guard let malangi else { return nil }
+        if let remoteId = malangi.remoteId,
+           let index = stored.firstIndex(where: { $0.remoteId == remoteId }) {
+            return index
+        }
+
+        return stored.firstIndex { $0.imagePath == malangi.imagePath }
+    }
+
     private static func saveStoredMalangis(_ malangis: [StoredMalangi]) {
         let data = try? JSONEncoder().encode(malangis)
         UserDefaults.standard.set(data, forKey: registeredMalangisKey)
+    }
+
+    private static func saveRemoteMalangis(_ malangis: [StoredMalangi]) {
+        let data = try? JSONEncoder().encode(malangis)
+        UserDefaults.standard.set(data, forKey: remoteMalangisKey)
     }
 
     private static func migrateLegacyRegistrationIfNeeded() {
@@ -999,7 +1309,7 @@ final class SettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         if let pendingImageURL {
             imageStatusLabel.stringValue = "\(pendingImageURL.lastPathComponent) 선택됨"
         } else if let selectedIndex, registrations.indices.contains(selectedIndex) {
-            imageStatusLabel.stringValue = URL(fileURLWithPath: registrations[selectedIndex].imagePath).lastPathComponent
+            imageStatusLabel.stringValue = ResourceLocator.displayName(for: registrations[selectedIndex].imagePath)
         } else {
             imageStatusLabel.stringValue = "새 사진 선택"
         }
@@ -1022,7 +1332,7 @@ final class SettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
         selectedIndex = row
         pendingImageURL = nil
-        soundDraftURLs = registrations[row].soundPaths.map { URL(fileURLWithPath: $0) }
+        soundDraftURLs = registrations[row].soundPaths.compactMap { ResourceLocator.url(for: $0) }
         nameField.stringValue = registrations[row].name
         refreshStatus()
     }
@@ -1089,7 +1399,7 @@ final class SettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate {
                 ?? NSTextField(labelWithString: "")
 
             cell.identifier = identifier
-            cell.stringValue = soundDraftURLs[row].lastPathComponent
+            cell.stringValue = ResourceLocator.displayName(for: soundDraftURLs[row])
             cell.lineBreakMode = .byTruncatingMiddle
             cell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
             return cell
@@ -1149,7 +1459,11 @@ final class SoundPlayer {
             return
         }
 
-        audioPlayer = try? AVAudioPlayer(contentsOf: url)
+        if url.isFileURL {
+            audioPlayer = try? AVAudioPlayer(contentsOf: url)
+        } else if let data = try? Data(contentsOf: url) {
+            audioPlayer = try? AVAudioPlayer(data: data)
+        }
         audioPlayer?.prepareToPlay()
         audioPlayer?.play()
     }
@@ -1276,8 +1590,9 @@ enum BackgroundRemover {
                 return false
             }
 
+            let selectedInstances = try bestForegroundInstances(from: observation, handler: handler)
             let maskBuffer = try observation.generateScaledMaskForImage(
-                forInstances: observation.allInstances,
+                forInstances: selectedInstances,
                 from: handler
             )
 
@@ -1308,6 +1623,87 @@ enum BackgroundRemover {
         } catch {
             return false
         }
+    }
+
+    @available(macOS 14.0, *)
+    private static func bestForegroundInstances(
+        from observation: VNInstanceMaskObservation,
+        handler: VNImageRequestHandler
+    ) throws -> IndexSet {
+        let instances = observation.allInstances
+        guard instances.count > 1 else {
+            return instances
+        }
+
+        var bestInstances = instances
+        var bestScore = -Double.infinity
+
+        for instance in instances {
+            let instanceSet = IndexSet(integer: instance)
+            let maskBuffer = try observation.generateScaledMaskForImage(forInstances: instanceSet, from: handler)
+            let score = scoreMask(maskBuffer)
+
+            if score > bestScore {
+                bestScore = score
+                bestInstances = instanceSet
+            }
+        }
+
+        return bestInstances
+    }
+
+    private static func scoreMask(_ maskBuffer: CVPixelBuffer) -> Double {
+        CVPixelBufferLockBaseAddress(maskBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(maskBuffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) else {
+            return -Double.infinity
+        }
+
+        let width = CVPixelBufferGetWidth(maskBuffer)
+        let height = CVPixelBufferGetHeight(maskBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(maskBuffer)
+        let format = CVPixelBufferGetPixelFormatType(maskBuffer)
+        var count = 0
+        var sumX = 0.0
+        var sumY = 0.0
+
+        if format == kCVPixelFormatType_OneComponent8 {
+            for y in 0..<height {
+                let row = baseAddress.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
+                for x in 0..<width where row[x] > 24 {
+                    count += 1
+                    sumX += Double(x)
+                    sumY += Double(y)
+                }
+            }
+        } else if format == kCVPixelFormatType_OneComponent32Float {
+            let floatsPerRow = bytesPerRow / MemoryLayout<Float>.size
+            for y in 0..<height {
+                let row = baseAddress.advanced(by: y * bytesPerRow).assumingMemoryBound(to: Float.self)
+                for x in 0..<width where row[x] > 0.1 {
+                    count += 1
+                    sumX += Double(x)
+                    sumY += Double(y)
+                }
+            }
+
+            _ = floatsPerRow
+        }
+
+        guard count > 0 else {
+            return -Double.infinity
+        }
+
+        let centerX = sumX / Double(count * max(width - 1, 1))
+        let centerY = sumY / Double(count * max(height - 1, 1))
+        let targetX = 0.5
+        let targetY = 0.68
+        let distance = hypot(centerX - targetX, centerY - targetY)
+        let centerBonus = max(0.0, 1.0 - distance)
+        let lowerFrameBonus = 0.75 + centerY * 0.5
+
+        return Double(count) * centerBonus * lowerFrameBonus
     }
 
     private static func removeConnectedLightBackground(
@@ -1402,7 +1798,22 @@ enum BackgroundRemover {
 }
 
 enum ResourceLocator {
+    static func image(for reference: String) -> NSImage? {
+        guard let url = url(for: reference) else { return nil }
+        if url.isFileURL {
+            return NSImage(contentsOf: url)
+        }
+
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return NSImage(data: data)
+    }
+
     static func url(for filename: String) -> URL? {
+        if let remoteURL = URL(string: filename),
+           ["http", "https"].contains(remoteURL.scheme?.lowercased()) {
+            return remoteURL
+        }
+
         let filenameURL = URL(fileURLWithPath: filename)
         if filename.hasPrefix("/"), FileManager.default.fileExists(atPath: filenameURL.path) {
             return filenameURL
@@ -1422,6 +1833,32 @@ enum ResourceLocator {
         }
 
         return nil
+    }
+
+    static func isLocalFileReference(_ value: String) -> Bool {
+        if let url = URL(string: value),
+           ["http", "https"].contains(url.scheme?.lowercased()) {
+            return false
+        }
+
+        return value.hasPrefix("/")
+    }
+
+    static func displayName(for value: String) -> String {
+        if let url = URL(string: value),
+           ["http", "https"].contains(url.scheme?.lowercased()) {
+            return url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
+        }
+
+        return URL(fileURLWithPath: value).lastPathComponent
+    }
+
+    static func displayName(for url: URL) -> String {
+        if ["http", "https"].contains(url.scheme?.lowercased()) {
+            return url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
+        }
+
+        return url.lastPathComponent
     }
 }
 
