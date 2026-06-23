@@ -94,13 +94,59 @@ SUPABASE_PUBLISHABLE_KEY
 
 마켓플레이스 동작:
 
-- 사용자는 Supabase Auth를 통해 이메일/비밀번호로 로그인 또는 회원가입할 수 있다.
+- 사용자는 Google OAuth를 통해 로그인할 수 있다. (신규 가입은 첫 로그인 시 자동)
 - 로그인한 사용자는 선택한 로컬 말랑이를 마켓플레이스에 업로드할 수 있다.
 - 사용자는 공개 마켓플레이스 말랑이를 새로고침하고 탐색할 수 있다.
-- 사용자는 마켓플레이스 말랑이를 자신의 로컬 목록으로 다운로드할 수 있다.
+- 앱 기본 제공 말랑이(.builtIn)는 로그인 없이 무료로 다운로드 가능하다.
+- 사용자가 올린 공유 말랑이(.shared)는 로그인 + 1포인트 차감 후 다운로드할 수 있다.
 - 다운로드한 말랑이는 즉시 플로팅 오버레이에서 사용 가능하다.
 
+포인트 경제:
+
+- 신규 가입(첫 로그인) 시 5포인트가 지급된다.
+- 공유 말랑이 다운로드 시 1포인트가 차감된다. 포인트 부족 시 다운로드가 차단된다.
+- 마켓플레이스에 말랑이를 신규 업로드하면 3포인트가 적립된다(갱신/PATCH 제외).
+- 본인이 올린 말랑이 재다운로드, 이미 받은 말랑이 재다운로드는 포인트가 차감되지 않는다.
+- 포인트 잔액은 서버(Supabase `profiles` 테이블)에서 관리되며 클라이언트 위조 불가.
+
 ## 5. Supabase 데이터 모델
+
+### 5.0 `public.profiles`
+
+목적: 사용자별 포인트 잔액 관리.
+
+주요 필드:
+
+```txt
+id         uuid (references auth.users)
+points     integer (default 5)
+created_at timestamptz
+```
+
+RLS 정책:
+- 본인 행만 읽기 가능. 쓰기는 SECURITY DEFINER 함수/트리거로만 허용.
+
+DB 트리거:
+- `on_auth_user_created`: `auth.users` insert 시 자동으로 5포인트 시드.
+- `on_marketplace_insert`: `marketplace_malangis` insert 시 owner에게 3포인트 적립.
+
+### 5.0.1 `public.downloads`
+
+목적: 다운로드 원장 — 사용자×말랑이 이중 차감 방지.
+
+주요 필드:
+
+```txt
+user_id    uuid (references auth.users) — PK 일부
+malangi_id uuid (references marketplace_malangis) — PK 일부
+created_at timestamptz
+```
+
+RLS 정책:
+- 본인 행만 읽기 가능.
+
+RPC 함수:
+- `download_marketplace_malangi(p_malangi_id uuid) returns integer`: 원자적 1포인트 차감 + `downloads_count` 증가 + 원장 기록. 포인트 부족 시 `INSUFFICIENT_POINTS` 예외.
 
 ### 5.1 `public.malangis`
 
@@ -255,7 +301,7 @@ malangi-assets
 - 이메일 인증 동작이 Supabase 대시보드 설정에 따라 달라진다.
 - 배경 제거는 최선 시도이며 어려운 이미지에서 실패할 수 있다.
 - 마켓플레이스 콘텐츠 관리나 어뷰징 제어가 없다.
-- 다운로드 수 증가 플로우가 아직 없다.
+- 다운로드 수 증가는 `download_marketplace_malangi` RPC 내부에서 원자적으로 처리됨.
 - 소유자가 마켓플레이스 목록을 관리하는 UI가 아직 없다.
 
 ## 11. 다음 마일스톤 제안

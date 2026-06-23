@@ -1,9 +1,12 @@
 import AppKit
 import AVFoundation
+import CryptoKit
 import ImageIO
 import CoreImage
+import AuthenticationServices
 import UniformTypeIdentifiers
 import Vision
+import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
@@ -11,6 +14,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("Wazak is running. Look near the center of your screen, or click the menu bar item labeled '와'.")
+        let client = SupabaseMalangiClient.shared
+        if let googleRedirectURI = client.googleRedirectURI {
+            print("""
+            ── Google OAuth 설정 가이드 ──────────────────────────────────────────
+            [1] Google Cloud Console → OAuth 클라이언트 ID → 승인된 리디렉션 URI:
+                \(googleRedirectURI)
+            [2] Supabase → Authentication → URL Configuration → Redirect URLs:
+                wazak://auth/callback
+            ─────────────────────────────────────────────────────────────────────
+            """)
+        }
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.async {
             self.configureStatusItem()
@@ -72,6 +86,10 @@ struct StoredMalangi: Codable {
     let imageFileName: String?
     let soundPaths: [String]
     let soundFileNames: [String]
+    // not persisted — set true only for remote-only "기본 말랑이" entries
+    var isDefault: Bool = false
+    // marketplace_malangis row id — nil if not published yet
+    var marketplaceId: String? = nil
 
     private enum CodingKeys: String, CodingKey {
         case remoteId
@@ -80,15 +98,17 @@ struct StoredMalangi: Codable {
         case imageFileName
         case soundPaths
         case soundFileNames
+        case marketplaceId
     }
 
-    init(remoteId: String? = nil, name: String, imagePath: String, imageFileName: String? = nil, soundPaths: [String], soundFileNames: [String]? = nil) {
+    init(remoteId: String? = nil, name: String, imagePath: String, imageFileName: String? = nil, soundPaths: [String], soundFileNames: [String]? = nil, marketplaceId: String? = nil) {
         self.remoteId = remoteId
         self.name = name
         self.imagePath = imagePath
         self.imageFileName = imageFileName
         self.soundPaths = soundPaths
         self.soundFileNames = soundFileNames ?? soundPaths.map { ResourceLocator.displayName(for: $0) }
+        self.marketplaceId = marketplaceId
     }
 
     init(from decoder: Decoder) throws {
@@ -100,6 +120,7 @@ struct StoredMalangi: Codable {
         soundPaths = try container.decode([String].self, forKey: .soundPaths)
         soundFileNames = try container.decodeIfPresent([String].self, forKey: .soundFileNames)
             ?? soundPaths.map { ResourceLocator.displayName(for: $0) }
+        marketplaceId = try container.decodeIfPresent(String.self, forKey: .marketplaceId)
     }
 
     func asMalangi() -> Malangi {
@@ -158,9 +179,31 @@ struct SupabaseMalangiPayload: Codable {
     }
 }
 
+struct SupabaseUserMetadata: Codable {
+    let nickname: String?   // 우리가 저장한 닉네임 (우선)
+    let fullName: String?   // 구글 full_name
+    let name: String?       // 구글 name (fallback)
+
+    private enum CodingKeys: String, CodingKey {
+        case nickname
+        case fullName = "full_name"
+        case name
+    }
+
+    /// 마켓/UI에 표시할 최종 이름: 닉네임 > 구글 full_name > 구글 name
+    var displayName: String? { nickname ?? fullName ?? name }
+}
+
 struct SupabaseUser: Codable {
     let id: String
     let email: String?
+    let userMetadata: SupabaseUserMetadata?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case userMetadata = "user_metadata"
+    }
 }
 
 struct SupabaseAuthSession: Codable {
@@ -179,6 +222,7 @@ struct MarketplaceMalangi: Codable {
     let id: String
     let ownerId: String
     let ownerEmail: String?
+    let ownerName: String?
     let name: String
     let imageURL: String
     let imageFileName: String?
@@ -190,6 +234,7 @@ struct MarketplaceMalangi: Codable {
         case id
         case ownerId = "owner_id"
         case ownerEmail = "owner_email"
+        case ownerName = "owner_name"
         case name
         case imageURL = "image_url"
         case imageFileName = "image_file_name"
@@ -202,6 +247,7 @@ struct MarketplaceMalangi: Codable {
 struct MarketplaceMalangiPayload: Codable {
     let ownerId: String
     let ownerEmail: String?
+    let ownerName: String?
     let name: String
     let imageURL: String
     let imageFileName: String?
@@ -212,6 +258,7 @@ struct MarketplaceMalangiPayload: Codable {
     private enum CodingKeys: String, CodingKey {
         case ownerId = "owner_id"
         case ownerEmail = "owner_email"
+        case ownerName = "owner_name"
         case name
         case imageURL = "image_url"
         case imageFileName = "image_file_name"
@@ -231,6 +278,7 @@ final class SupabaseMalangiClient {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let authSessionKey = "supabase.authSession"
+    private var webAuth: WebAuthCoordinator?
 
     private var isConfigured: Bool {
         baseURL != nil && publishableKey?.isEmpty == false
@@ -238,6 +286,13 @@ final class SupabaseMalangiClient {
 
     var canSync: Bool {
         isConfigured
+    }
+
+    /// Google Cloud Console의 "승인된 리디렉션 URI"에 입력해야 하는 주소 (SUPABASE_URL 기반).
+    var googleRedirectURI: String? {
+        guard let baseURL else { return nil }
+        return baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            + "/auth/v1/callback"
     }
 
     var authSession: SupabaseAuthSession? {
@@ -321,30 +376,120 @@ final class SupabaseMalangiClient {
         return try publicAssetURL(objectPath: objectPath).absoluteString
     }
 
-    func signIn(email: String, password: String) throws -> SupabaseAuthSession {
-        let payload = ["email": email, "password": password]
+    // MARK: - Google OAuth (PKCE + loopback)
+
+    /// ASWebAuthenticationSession으로 구글 로그인 → wazak://auth/callback 콜백 수신 → PKCE 세션 교환.
+    /// 메인스레드에서 호출해야 합니다.
+    func signInWithGoogle(completion: @escaping (Result<SupabaseAuthSession, Error>) -> Void) {
+        guard isConfigured, let baseURL else {
+            completion(.failure(NSError(domain: "Wazak", code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "Supabase 환경변수가 설정되지 않았어요."])))
+            return
+        }
+
+        let pkce = PKCE()
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.path = "/auth/v1/authorize"
+        components?.queryItems = [
+            URLQueryItem(name: "provider", value: "google"),
+            URLQueryItem(name: "redirect_to", value: "wazak://auth/callback"),
+            URLQueryItem(name: "code_challenge", value: pkce.challenge),
+            URLQueryItem(name: "code_challenge_method", value: "s256")
+        ]
+
+        guard let authorizeURL = components?.url else {
+            completion(.failure(NSError(domain: "Wazak", code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "구글 로그인 URL을 만들 수 없어요."])))
+            return
+        }
+
+        cancelGoogleSignIn()
+        let coordinator = WebAuthCoordinator()
+        webAuth = coordinator
+
+        // ASWebAuthenticationSession은 메인스레드에서 시작해야 함
+        DispatchQueue.main.async {
+            coordinator.start(url: authorizeURL, scheme: "wazak") { [weak self] result in
+            // ASWebAuthenticationSession completion은 메인스레드로 옴
+            guard let self else { return }
+            self.webAuth = nil
+
+            switch result {
+            case .failure(let error):
+                // 사용자가 창을 닫아 취소한 경우 — 에러 없이 조용히 종료
+                let code = (error as? ASWebAuthenticationSessionError)?.code
+                if code == .canceledLogin {
+                    completion(.failure(error))
+                    return
+                }
+                completion(.failure(error))
+
+            case .success(let callbackURL):
+                guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "code" })?.value
+                else {
+                    let desc = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
+                        .queryItems?.first(where: { $0.name == "error_description" })?.value
+                    completion(.failure(NSError(domain: "Wazak", code: 12,
+                        userInfo: [NSLocalizedDescriptionKey: desc ?? "콜백 URL에서 code를 찾을 수 없어요."])))
+                    return
+                }
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let session = try self.exchangeCodeForSession(authCode: code, codeVerifier: pkce.verifier)
+                        DispatchQueue.main.async { completion(.success(session)) }
+                    } catch {
+                        DispatchQueue.main.async { completion(.failure(error)) }
+                    }
+                }
+            }
+            } // coordinator.start closure
+        } // DispatchQueue.main.async
+    }
+
+    func cancelGoogleSignIn() {
+        webAuth?.cancel()
+        webAuth = nil
+    }
+
+    private func exchangeCodeForSession(authCode: String, codeVerifier: String) throws -> SupabaseAuthSession {
+        struct PKCEPayload: Codable {
+            let authCode: String
+            let codeVerifier: String
+            private enum CodingKeys: String, CodingKey {
+                case authCode = "auth_code"
+                case codeVerifier = "code_verifier"
+            }
+        }
+
         var request = try makeRequest(path: "/auth/v1/token", queryItems: [
-            URLQueryItem(name: "grant_type", value: "password")
+            URLQueryItem(name: "grant_type", value: "pkce")
         ])
         request.httpMethod = "POST"
-        request.httpBody = try encoder.encode(payload)
+        request.httpBody = try encoder.encode(PKCEPayload(authCode: authCode, codeVerifier: codeVerifier))
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let session: SupabaseAuthSession = try perform(request)
         saveAuthSession(session)
+        print("[OAuth] 세션 교환 성공 — user: \(session.user.id)")
         return session
     }
 
-    func signUp(email: String, password: String) throws -> SupabaseAuthSession {
-        let payload = ["email": email, "password": password]
-        var request = try makeRequest(path: "/auth/v1/signup")
-        request.httpMethod = "POST"
-        request.httpBody = try encoder.encode(payload)
+    /// 닉네임을 Supabase user_metadata에 저장합니다.
+    func updateNickname(_ nickname: String) throws {
+        guard let session = authSession else { return }
+        struct Body: Codable { let data: [String: String] }
+        var request = try makeRequest(path: "/auth/v1/user", accessToken: session.accessToken)
+        request.httpMethod = "PUT"
+        request.httpBody = try encoder.encode(Body(data: ["nickname": nickname]))
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let session: SupabaseAuthSession = try perform(request)
-        saveAuthSession(session)
-        return session
+        let user: SupabaseUser = try perform(request)
+        saveAuthSession(SupabaseAuthSession(
+            accessToken: session.accessToken,
+            refreshToken: session.refreshToken,
+            user: user
+        ))
     }
 
     func signOut() {
@@ -354,11 +499,38 @@ final class SupabaseMalangiClient {
     func fetchMarketplace() throws -> [MarketplaceMalangi] {
         guard isConfigured else { return [] }
         var request = try makeRequest(path: "/rest/v1/marketplace_malangis", queryItems: [
-            URLQueryItem(name: "select", value: "id,owner_id,owner_email,name,image_url,image_file_name,sound_urls,sound_file_names,downloads_count"),
+            URLQueryItem(name: "select", value: "id,owner_id,owner_email,owner_name,name,image_url,image_file_name,sound_urls,sound_file_names,downloads_count"),
             URLQueryItem(name: "is_public", value: "eq.true"),
             URLQueryItem(name: "order", value: "created_at.desc")
         ])
         request.httpMethod = "GET"
+        return try perform(request)
+    }
+
+    /// 현재 로그인 사용자의 포인트 잔액을 조회합니다. 미로그인/미설정 시 nil.
+    func fetchMyPoints() throws -> Int? {
+        guard isConfigured, let session = authSession else { return nil }
+        struct Row: Codable { let points: Int }
+        var request = try makeRequest(path: "/rest/v1/profiles", queryItems: [
+            URLQueryItem(name: "select", value: "points"),
+            URLQueryItem(name: "id", value: "eq.\(session.user.id)")
+        ], accessToken: session.accessToken)
+        request.httpMethod = "GET"
+        let rows: [Row] = try perform(request)
+        return rows.first?.points
+    }
+
+    /// 공유 말랑이 다운로드 — 1포인트 차감 후 남은 포인트를 반환합니다.
+    /// 포인트 부족 시 "INSUFFICIENT_POINTS" 를 포함한 에러를 던집니다.
+    func downloadMarketplaceMalangi(id: String, session: SupabaseAuthSession) throws -> Int {
+        struct Body: Codable { let p_malangi_id: String }
+        var request = try makeRequest(
+            path: "/rest/v1/rpc/download_marketplace_malangi",
+            accessToken: session.accessToken
+        )
+        request.httpMethod = "POST"
+        request.httpBody = try encoder.encode(Body(p_malangi_id: id))
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return try perform(request)
     }
 
@@ -386,6 +558,7 @@ final class SupabaseMalangiClient {
         let payload = MarketplaceMalangiPayload(
             ownerId: session.user.id,
             ownerEmail: session.user.email,
+            ownerName: session.user.userMetadata?.displayName,
             name: malangi.name,
             imageURL: imageURL,
             imageFileName: malangi.imageFileName,
@@ -394,10 +567,23 @@ final class SupabaseMalangiClient {
             isPublic: true
         )
 
-        var request = try makeRequest(path: "/rest/v1/marketplace_malangis", queryItems: [
-            URLQueryItem(name: "select", value: "id,owner_id,owner_email,name,image_url,image_file_name,sound_urls,sound_file_names,downloads_count")
-        ], accessToken: session.accessToken)
-        request.httpMethod = "POST"
+        let selectQuery = URLQueryItem(name: "select", value: "id,owner_id,owner_email,owner_name,name,image_url,image_file_name,sound_urls,sound_file_names,downloads_count")
+
+        var request: URLRequest
+        if let existingId = malangi.marketplaceId {
+            // 이미 게시된 말랑이 → PATCH로 갱신
+            request = try makeRequest(path: "/rest/v1/marketplace_malangis", queryItems: [
+                URLQueryItem(name: "id", value: "eq.\(existingId)"),
+                selectQuery
+            ], accessToken: session.accessToken)
+            request.httpMethod = "PATCH"
+        } else {
+            // 첫 게시 → POST로 insert
+            request = try makeRequest(path: "/rest/v1/marketplace_malangis", queryItems: [
+                selectQuery
+            ], accessToken: session.accessToken)
+            request.httpMethod = "POST"
+        }
         request.httpBody = try encoder.encode(payload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("return=representation", forHTTPHeaderField: "Prefer")
@@ -1066,7 +1252,9 @@ enum MalangiSettings {
     private static let soundPathsKey = "malangi.soundPaths"
     private static let registeredMalangisKey = "malangi.registeredMalangis"
     private static let remoteMalangisKey = "malangi.remoteMalangis"
+    private static let hiddenDefaultsKey = "malangi.hiddenDefaults"
     private static let didMigrateLegacyKey = "malangi.didMigrateLegacy"
+    private static let didClaimPeanutKey = "malangi.didClaimPeanut"
 
     static var registeredMalangis: [Malangi] {
         migrateLegacyRegistrationIfNeeded()
@@ -1094,22 +1282,13 @@ enum MalangiSettings {
 
         try FileManager.default.createDirectory(at: registrationDirectory, withIntermediateDirectories: true)
 
-        let storageClient = SupabaseMalangiClient.shared
         let imagePath: String
         let imageFileName: String?
         if let sourceURL {
             let outputURL = registrationDirectory.appendingPathComponent("malangi.png")
             try BackgroundRemover.writeTransparentPNG(from: sourceURL, to: outputURL)
             imageFileName = sourceURL.lastPathComponent
-            if storageClient.canSync {
-                imagePath = try storageClient.uploadAsset(
-                    fileURL: outputURL,
-                    objectPath: "malangis/\(assetFolder)/\(storageSafeImageFileName())",
-                    contentType: "image/png"
-                )
-            } else {
-                imagePath = outputURL.path
-            }
+            imagePath = outputURL.path
         } else if let existing {
             imagePath = existing.imagePath
             imageFileName = existing.imageFileName
@@ -1129,18 +1308,15 @@ enum MalangiSettings {
         }
 
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        var storedMalangi = StoredMalangi(
+        let storedMalangi = StoredMalangi(
             remoteId: existing?.remoteId,
             name: trimmedName.isEmpty ? "말랑이 \(stored.count + 1)" : trimmedName,
             imagePath: imagePath,
             imageFileName: imageFileName,
             soundPaths: soundPaths,
-            soundFileNames: soundFileNames
+            soundFileNames: soundFileNames,
+            marketplaceId: existing?.marketplaceId
         )
-
-        if let remoteMalangi = try? SupabaseMalangiClient.shared.upsert(storedMalangi) {
-            storedMalangi = remoteMalangi
-        }
 
         if let localIndex = localIndex(for: existing, in: stored) {
             stored[localIndex] = storedMalangi
@@ -1154,29 +1330,34 @@ enum MalangiSettings {
     }
 
     static func deleteMalangi(at index: Int) throws {
-        var stored = storedMalangis
         let allRegistrations = registrations
         guard allRegistrations.indices.contains(index) else { return }
 
         let removed = allRegistrations[index]
-        if let remoteId = removed.remoteId {
-            try? SupabaseMalangiClient.shared.delete(id: remoteId)
-        }
 
-        if let localIndex = localIndex(for: removed, in: stored) {
-            stored.remove(at: localIndex)
-        }
-
-        if ResourceLocator.isLocalFileReference(removed.imagePath) {
-            let directory = URL(fileURLWithPath: removed.imagePath).deletingLastPathComponent()
-            if FileManager.default.fileExists(atPath: directory.path) {
-                try? FileManager.default.removeItem(at: directory)
+        if removed.isDefault {
+            // 기본 말랑이: 서버 행 유지, 로컬에서 숨기기만 함
+            guard let remoteId = removed.remoteId else { return }
+            var hidden = hiddenDefaults
+            hidden.insert(remoteId)
+            saveHiddenDefaults(hidden)
+            notifyChanged()
+        } else {
+            // 개인/마켓 다운로드 말랑이: 로컬 파일 + UserDefaults에서 완전 삭제
+            var stored = storedMalangis
+            if let localIndex = localIndex(for: removed, in: stored) {
+                stored.remove(at: localIndex)
             }
+            if ResourceLocator.isLocalFileReference(removed.imagePath) {
+                let directory = URL(fileURLWithPath: removed.imagePath).deletingLastPathComponent()
+                if FileManager.default.fileExists(atPath: directory.path) {
+                    try? FileManager.default.removeItem(at: directory)
+                }
+            }
+            saveStoredMalangis(stored)
+            refreshRemoteRegistrations()
+            notifyChanged()
         }
-
-        saveStoredMalangis(stored)
-        refreshRemoteRegistrations()
-        notifyChanged()
     }
 
     static func addMarketplaceMalangi(_ marketplaceMalangi: MarketplaceMalangi) {
@@ -1207,8 +1388,55 @@ enum MalangiSettings {
             }
 
             saveRemoteMalangis(remoteMalangis)
+            claimDefaultAsLocalIfNeeded(name: "땅콩 크런치")
             notifyChanged()
         }
+    }
+
+    /// 특정 원격 기본 말랑이를 일회성으로 로컬 말랑이(remoteId=nil)로 복제하고 원격 기본은 숨깁니다.
+    /// 앱 첫 실행 후 원격 캐시가 채워진 뒤 1회만 수행됩니다 (didClaimPeanutKey 플래그).
+    private static func claimDefaultAsLocalIfNeeded(name: String) {
+        guard !UserDefaults.standard.bool(forKey: didClaimPeanutKey) else { return }
+        guard let target = remoteMalangis.first(where: { $0.name == name }),
+              let remoteId = target.remoteId else { return }
+
+        var local = storedMalangis
+        if !local.contains(where: { $0.name == name && $0.remoteId == nil }) {
+            let localCopy = StoredMalangi(
+                remoteId: nil,
+                name: target.name,
+                imagePath: target.imagePath,
+                imageFileName: target.imageFileName,
+                soundPaths: target.soundPaths,
+                soundFileNames: target.soundFileNames,
+                marketplaceId: nil
+            )
+            local.append(localCopy)
+            saveStoredMalangis(local)
+        }
+
+        var hidden = hiddenDefaults
+        hidden.insert(remoteId)
+        saveHiddenDefaults(hidden)
+
+        UserDefaults.standard.set(true, forKey: didClaimPeanutKey)
+    }
+
+    /// 로컬에 저장된 말랑이의 marketplaceId를 갱신합니다 (업로드/재업로드 후 호출).
+    static func setMarketplaceId(_ id: String?, for malangi: StoredMalangi) {
+        var stored = storedMalangis
+        guard let idx = localIndex(for: malangi, in: stored) else { return }
+        let existing = stored[idx]
+        stored[idx] = StoredMalangi(
+            remoteId: existing.remoteId,
+            name: existing.name,
+            imagePath: existing.imagePath,
+            imageFileName: existing.imageFileName,
+            soundPaths: existing.soundPaths,
+            soundFileNames: existing.soundFileNames,
+            marketplaceId: id
+        )
+        saveStoredMalangis(stored)
     }
 
     private static func saveSounds(_ sourceDrafts: [SoundDraft], in registrationDirectory: URL) throws -> (paths: [String], fileNames: [String]) {
@@ -1235,19 +1463,11 @@ enum MalangiSettings {
         }
         try FileManager.default.createDirectory(at: soundDirectory, withIntermediateDirectories: true)
 
-        let storageClient = SupabaseMalangiClient.shared
         let savedPaths = try stagedDrafts.map { draft in
             let stagedURL = draft.url
             let fileName = stagedURL.lastPathComponent
             let destinationURL = soundDirectory.appendingPathComponent(fileName)
             try FileManager.default.moveItem(at: stagedURL, to: destinationURL)
-            if storageClient.canSync {
-                return try storageClient.uploadAsset(
-                    fileURL: destinationURL,
-                    objectPath: "malangis/\(assetFolder)/sounds/\(fileName)",
-                    contentType: contentType(for: destinationURL)
-                )
-            }
             return destinationURL.path
         }
 
@@ -1324,14 +1544,29 @@ enum MalangiSettings {
         let local = storedMalangis
         let localRemoteIds = Set(local.compactMap(\.remoteId))
         let localImagePaths = Set(local.map(\.imagePath))
+        let hidden = hiddenDefaults
+
         let remoteOnly = remoteMalangis.filter { remote in
+            // 숨겨진 기본 말랑이는 목록에서 제외
+            if let remoteId = remote.remoteId, hidden.contains(remoteId) { return false }
             if let remoteId = remote.remoteId {
                 return !localRemoteIds.contains(remoteId)
             }
             return !localImagePaths.contains(remote.imagePath)
         }
 
-        return local + remoteOnly
+        // local + remote-only 합친 뒤, remoteId != nil 이면 기본 말랑이로 마킹
+        // 숨겨진 local(remoteId 있음) 항목도 제거
+        let combined = (local.filter { m in
+            guard let rid = m.remoteId else { return true }
+            return !hidden.contains(rid)
+        }) + remoteOnly
+
+        return combined.map { m -> StoredMalangi in
+            var x = m
+            x.isDefault = (m.remoteId != nil)
+            return x
+        }
     }
 
     private static func localIndex(for malangi: StoredMalangi?, in stored: [StoredMalangi]) -> Int? {
@@ -1352,6 +1587,32 @@ enum MalangiSettings {
     private static func saveRemoteMalangis(_ malangis: [StoredMalangi]) {
         let data = try? JSONEncoder().encode(malangis)
         UserDefaults.standard.set(data, forKey: remoteMalangisKey)
+    }
+
+    private static var hiddenDefaults: Set<String> {
+        let arr = UserDefaults.standard.stringArray(forKey: hiddenDefaultsKey) ?? []
+        return Set(arr)
+    }
+
+    private static func saveHiddenDefaults(_ ids: Set<String>) {
+        UserDefaults.standard.set(Array(ids), forKey: hiddenDefaultsKey)
+    }
+
+    /// 숨김 해제: 마켓플레이스에서 기본 말랑이를 다시 받을 때 호출.
+    static func unhideDefault(remoteId: String) {
+        var hidden = hiddenDefaults
+        hidden.remove(remoteId)
+        saveHiddenDefaults(hidden)
+        notifyChanged()
+    }
+
+    /// 마켓플레이스 탭에서 표시할 기본 말랑이 카탈로그 (malangis 테이블 전체).
+    static var defaultCatalog: [StoredMalangi] {
+        return remoteMalangis.map { remote -> StoredMalangi in
+            var m = remote
+            m.isDefault = true
+            return m
+        }
     }
 
     private static func migrateLegacyRegistrationIfNeeded() {
@@ -1406,666 +1667,33 @@ final class SettingsPresenter {
             settingsWindow?.isReleasedWhenClosed = false
         }
 
-        (settingsWindow?.contentView as? SettingsView)?.resetForPresentation()
+        settingsWindow?.resetForPresentation()
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 }
 
 final class SettingsWindow: NSWindow {
+    let viewModel = SettingsViewModel()
+
     init() {
-        let view = SettingsView(frame: NSRect(x: 0, y: 0, width: 640, height: 430))
         super.init(
-            contentRect: view.frame,
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 480),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
-
-        title = "Wazak Settings"
+        title = "Wazak 설정"
         center()
-        contentView = view
-    }
-}
 
-final class SettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate {
-    private let titleLabel = NSTextField(labelWithString: "말랑이 등록하기")
-    private let modeControl = NSSegmentedControl(labels: ["내 말랑이", "마켓플레이스"], trackingMode: .selectOne, target: nil, action: nil)
-    private let tableView = NSTableView(frame: .zero)
-    private let soundTableView = NSTableView(frame: .zero)
-    private let marketplaceTableView = NSTableView(frame: .zero)
-    private let marketplacePanel = NSView(frame: .zero)
-    private let authEmailField = NSTextField(string: "")
-    private let authPasswordField = NSSecureTextField(string: "")
-    private let authStatusLabel = NSTextField(labelWithString: "")
-    private let marketplaceStatusLabel = NSTextField(labelWithString: "")
-    private let uploadMarketplaceButton = NSButton(title: "마켓플레이스에 올리기", target: nil, action: nil)
-    private let downloadMarketplaceButton = NSButton(title: "다운로드", target: nil, action: nil)
-    private let refreshMarketplaceButton = NSButton(title: "새로고침", target: nil, action: nil)
-    private let signInButton = NSButton(title: "로그인", target: nil, action: nil)
-    private let signUpButton = NSButton(title: "가입", target: nil, action: nil)
-    private let signOutButton = NSButton(title: "로그아웃", target: nil, action: nil)
-    private let nameField = NSTextField(string: "")
-    private let imageStatusLabel = NSTextField(labelWithString: "")
-    private let imagePreview = NSImageView(frame: .zero)
-    private let soundStatusLabel = NSTextField(labelWithString: "")
-    private let confirmButton = NSButton(title: "확인", target: nil, action: nil)
-    private let deleteMalangiButton = NSButton(title: "삭제", target: nil, action: nil)
-    private let deleteSoundButton = NSButton(title: "사운드 삭제", target: nil, action: nil)
-    private let spinner = NSProgressIndicator(frame: .zero)
-    private var registrations: [StoredMalangi] = []
-    private var marketplaceMalangis: [MarketplaceMalangi] = []
-    private var localContentViews: [NSView] = []
-    private var selectedIndex: Int?
-    private var selectedMarketplaceIndex: Int?
-    private var pendingImageURL: URL?
-    private var soundDrafts: [SoundDraft] = []
-    private var isSaving = false
+        let rootView = SettingsRootView(viewModel: viewModel)
+        contentViewController = NSHostingController(rootView: rootView)
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        buildUI()
-        refreshStatus()
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    private func buildUI() {
-        titleLabel.font = NSFont.systemFont(ofSize: 18, weight: .bold)
-        titleLabel.frame = NSRect(x: 24, y: 382, width: 260, height: 24)
-        addSubview(titleLabel)
-
-        let listLabel = NSTextField(labelWithString: "등록된 말랑이")
-        listLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        listLabel.textColor = .secondaryLabelColor
-        listLabel.frame = NSRect(x: 24, y: 350, width: 160, height: 18)
-        addSubview(listLabel)
-
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
-        column.width = 180
-        tableView.addTableColumn(column)
-        tableView.headerView = nil
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.rowHeight = 30
-        tableView.allowsEmptySelection = true
-        tableView.target = self
-        tableView.action = #selector(selectRegistration)
-
-        let scrollView = NSScrollView(frame: NSRect(x: 24, y: 76, width: 190, height: 268))
-        scrollView.borderType = .bezelBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.documentView = tableView
-        addSubview(scrollView)
-
-        let newButton = NSButton(title: "새 말랑이", target: self, action: #selector(newRegistration))
-        newButton.bezelStyle = .rounded
-        newButton.frame = NSRect(x: 24, y: 28, width: 92, height: 30)
-        addSubview(newButton)
-
-        deleteMalangiButton.target = self
-        deleteMalangiButton.action = #selector(deleteRegistration)
-        deleteMalangiButton.bezelStyle = .rounded
-        deleteMalangiButton.frame = NSRect(x: 124, y: 28, width: 72, height: 30)
-        addSubview(deleteMalangiButton)
-
-        let nameLabel = NSTextField(labelWithString: "이름")
-        nameLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        nameLabel.textColor = .secondaryLabelColor
-        nameLabel.frame = NSRect(x: 250, y: 350, width: 180, height: 18)
-        addSubview(nameLabel)
-
-        nameField.placeholderString = "말랑이 이름"
-        nameField.frame = NSRect(x: 250, y: 320, width: 340, height: 28)
-        addSubview(nameField)
-
-        let imageButton = NSButton(title: "말랑이 사진 등록", target: self, action: #selector(selectImage))
-        imageButton.bezelStyle = .rounded
-        imageButton.frame = NSRect(x: 250, y: 270, width: 150, height: 32)
-        addSubview(imageButton)
-
-        imageStatusLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        imageStatusLabel.textColor = .secondaryLabelColor
-        imageStatusLabel.lineBreakMode = .byTruncatingMiddle
-        imageStatusLabel.frame = NSRect(x: 412, y: 282, width: 92, height: 20)
-        addSubview(imageStatusLabel)
-
-        imagePreview.imageScaling = .scaleProportionallyUpOrDown
-        imagePreview.imageAlignment = .alignCenter
-        imagePreview.imageFrameStyle = .grayBezel
-        imagePreview.frame = NSRect(x: 512, y: 258, width: 78, height: 54)
-        addSubview(imagePreview)
-
-        let soundButton = NSButton(title: "사운드 여러 개 등록", target: self, action: #selector(selectSounds))
-        soundButton.bezelStyle = .rounded
-        soundButton.frame = NSRect(x: 250, y: 220, width: 150, height: 32)
-        addSubview(soundButton)
-
-        soundStatusLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        soundStatusLabel.textColor = .secondaryLabelColor
-        soundStatusLabel.lineBreakMode = .byTruncatingTail
-        soundStatusLabel.frame = NSRect(x: 412, y: 225, width: 178, height: 20)
-        addSubview(soundStatusLabel)
-
-        let soundListLabel = NSTextField(labelWithString: "등록된 사운드")
-        soundListLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        soundListLabel.textColor = .secondaryLabelColor
-        soundListLabel.frame = NSRect(x: 250, y: 188, width: 180, height: 18)
-        addSubview(soundListLabel)
-
-        let soundColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("sound"))
-        soundColumn.width = 330
-        soundTableView.addTableColumn(soundColumn)
-        soundTableView.headerView = nil
-        soundTableView.delegate = self
-        soundTableView.dataSource = self
-        soundTableView.rowHeight = 26
-        soundTableView.allowsEmptySelection = true
-        soundTableView.target = self
-        soundTableView.action = #selector(selectSound)
-
-        let soundScrollView = NSScrollView(frame: NSRect(x: 250, y: 76, width: 340, height: 108))
-        soundScrollView.borderType = .bezelBorder
-        soundScrollView.hasVerticalScroller = true
-        soundScrollView.documentView = soundTableView
-        addSubview(soundScrollView)
-
-        deleteSoundButton.target = self
-        deleteSoundButton.action = #selector(deleteSelectedSound)
-        deleteSoundButton.bezelStyle = .rounded
-        deleteSoundButton.frame = NSRect(x: 250, y: 28, width: 100, height: 30)
-        addSubview(deleteSoundButton)
-
-        confirmButton.target = self
-        confirmButton.action = #selector(confirmSettings)
-        confirmButton.bezelStyle = .rounded
-        confirmButton.keyEquivalent = "\r"
-        confirmButton.frame = NSRect(x: 518, y: 28, width: 72, height: 30)
-        addSubview(confirmButton)
-
-        spinner.style = .spinning
-        spinner.controlSize = .small
-        spinner.isDisplayedWhenStopped = false
-        spinner.frame = NSRect(x: 488, y: 33, width: 18, height: 18)
-        addSubview(spinner)
-
-        localContentViews = subviews
-        buildModeControl()
-        buildMarketplaceUI()
-        updateMode()
-    }
-
-    private func buildModeControl() {
-        modeControl.target = self
-        modeControl.action = #selector(changeSettingsMode)
-        modeControl.selectedSegment = 0
-        modeControl.frame = NSRect(x: 400, y: 382, width: 190, height: 26)
-        addSubview(modeControl)
-    }
-
-    private func buildMarketplaceUI() {
-        marketplacePanel.frame = NSRect(x: 24, y: 24, width: 592, height: 346)
-        marketplacePanel.isHidden = true
-        addSubview(marketplacePanel)
-
-        let authLabel = NSTextField(labelWithString: "로그인")
-        authLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        authLabel.textColor = .secondaryLabelColor
-        authLabel.frame = NSRect(x: 0, y: 316, width: 80, height: 18)
-        marketplacePanel.addSubview(authLabel)
-
-        authEmailField.placeholderString = "email"
-        authEmailField.frame = NSRect(x: 0, y: 286, width: 170, height: 26)
-        marketplacePanel.addSubview(authEmailField)
-
-        authPasswordField.placeholderString = "password"
-        authPasswordField.frame = NSRect(x: 178, y: 286, width: 130, height: 26)
-        marketplacePanel.addSubview(authPasswordField)
-
-        signInButton.target = self
-        signInButton.action = #selector(signIn)
-        signInButton.bezelStyle = .rounded
-        signInButton.frame = NSRect(x: 318, y: 284, width: 64, height: 30)
-        marketplacePanel.addSubview(signInButton)
-
-        signUpButton.target = self
-        signUpButton.action = #selector(signUp)
-        signUpButton.bezelStyle = .rounded
-        signUpButton.frame = NSRect(x: 388, y: 284, width: 54, height: 30)
-        marketplacePanel.addSubview(signUpButton)
-
-        signOutButton.target = self
-        signOutButton.action = #selector(signOut)
-        signOutButton.bezelStyle = .rounded
-        signOutButton.frame = NSRect(x: 448, y: 284, width: 74, height: 30)
-        marketplacePanel.addSubview(signOutButton)
-
-        authStatusLabel.font = NSFont.systemFont(ofSize: 12)
-        authStatusLabel.textColor = .secondaryLabelColor
-        authStatusLabel.lineBreakMode = .byTruncatingMiddle
-        authStatusLabel.frame = NSRect(x: 0, y: 260, width: 520, height: 18)
-        marketplacePanel.addSubview(authStatusLabel)
-
-        uploadMarketplaceButton.target = self
-        uploadMarketplaceButton.action = #selector(uploadSelectedToMarketplace)
-        uploadMarketplaceButton.bezelStyle = .rounded
-        uploadMarketplaceButton.frame = NSRect(x: 0, y: 220, width: 172, height: 30)
-        marketplacePanel.addSubview(uploadMarketplaceButton)
-
-        refreshMarketplaceButton.target = self
-        refreshMarketplaceButton.action = #selector(refreshMarketplace)
-        refreshMarketplaceButton.bezelStyle = .rounded
-        refreshMarketplaceButton.frame = NSRect(x: 182, y: 220, width: 86, height: 30)
-        marketplacePanel.addSubview(refreshMarketplaceButton)
-
-        downloadMarketplaceButton.target = self
-        downloadMarketplaceButton.action = #selector(downloadSelectedMarketplaceMalangi)
-        downloadMarketplaceButton.bezelStyle = .rounded
-        downloadMarketplaceButton.frame = NSRect(x: 278, y: 220, width: 86, height: 30)
-        marketplacePanel.addSubview(downloadMarketplaceButton)
-
-        marketplaceStatusLabel.font = NSFont.systemFont(ofSize: 12)
-        marketplaceStatusLabel.textColor = .secondaryLabelColor
-        marketplaceStatusLabel.frame = NSRect(x: 374, y: 226, width: 210, height: 18)
-        marketplacePanel.addSubview(marketplaceStatusLabel)
-
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("marketplace"))
-        column.width = 560
-        marketplaceTableView.addTableColumn(column)
-        marketplaceTableView.headerView = nil
-        marketplaceTableView.delegate = self
-        marketplaceTableView.dataSource = self
-        marketplaceTableView.rowHeight = 36
-        marketplaceTableView.allowsEmptySelection = true
-        marketplaceTableView.target = self
-        marketplaceTableView.action = #selector(selectMarketplace)
-
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 592, height: 210))
-        scrollView.borderType = .bezelBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.documentView = marketplaceTableView
-        marketplacePanel.addSubview(scrollView)
-    }
-
-    @objc private func selectImage() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
-
-        guard panel.runModal() == .OK, let url = panel.url else {
-            return
-        }
-
-        pendingImageURL = url
-        refreshStatus()
-    }
-
-    @objc private func changeSettingsMode() {
-        updateMode()
-    }
-
-    @objc private func signIn() {
-        authenticate(isSignUp: false)
-    }
-
-    @objc private func signUp() {
-        authenticate(isSignUp: true)
-    }
-
-    @objc private func signOut() {
-        SupabaseMalangiClient.shared.signOut()
-        refreshStatus()
-    }
-
-    @objc private func refreshMarketplace() {
-        marketplaceStatusLabel.stringValue = "불러오는 중"
-        DispatchQueue.global(qos: .utility).async {
-            let result = Result { try SupabaseMalangiClient.shared.fetchMarketplace() }
-            DispatchQueue.main.async {
-                switch result {
-                case .success(let rows):
-                    self.marketplaceMalangis = rows
-                    self.marketplaceTableView.reloadData()
-                    self.marketplaceStatusLabel.stringValue = "\(rows.count)개"
-                case .failure(let error):
-                    self.marketplaceStatusLabel.stringValue = "조회 실패"
-                    self.showError("마켓 조회 실패", detail: error.localizedDescription)
-                }
-                self.updateActionStates()
-            }
-        }
-    }
-
-    @objc private func selectMarketplace() {
-        let row = marketplaceTableView.selectedRow
-        selectedMarketplaceIndex = marketplaceMalangis.indices.contains(row) ? row : nil
-        updateActionStates()
-    }
-
-    @objc private func uploadSelectedToMarketplace() {
-        guard let selectedIndex, registrations.indices.contains(selectedIndex) else {
-            showError("말랑이를 선택해 주세요.", detail: "내 말랑이 탭에서 업로드할 말랑이를 먼저 선택해 주세요.")
-            return
-        }
-        guard let session = SupabaseMalangiClient.shared.authSession else {
-            showError("로그인이 필요해요.", detail: "마켓플레이스에 올리려면 먼저 로그인해 주세요.")
-            return
-        }
-
-        marketplaceStatusLabel.stringValue = "업로드 중"
-        let malangi = registrations[selectedIndex]
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { try SupabaseMalangiClient.shared.publishToMarketplace(malangi, session: session) }
-            DispatchQueue.main.async {
-                switch result {
-                case .success:
-                    self.marketplaceStatusLabel.stringValue = "업로드 완료"
-                    self.refreshMarketplace()
-                case .failure(let error):
-                    self.marketplaceStatusLabel.stringValue = "업로드 실패"
-                    self.showError("업로드 실패", detail: error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    @objc private func downloadSelectedMarketplaceMalangi() {
-        guard let selectedMarketplaceIndex,
-              marketplaceMalangis.indices.contains(selectedMarketplaceIndex) else { return }
-
-        let item = marketplaceMalangis[selectedMarketplaceIndex]
-        MalangiSettings.addMarketplaceMalangi(item)
-        refreshStatus()
-        marketplaceStatusLabel.stringValue = "다운로드 완료"
-    }
-
-    @objc private func selectSounds() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.mp3, .mpeg4Audio, .wav, .aiff]
-
-        guard panel.runModal() == .OK, !panel.urls.isEmpty else {
-            return
-        }
-
-        soundDrafts.append(contentsOf: panel.urls.map { SoundDraft(url: $0, displayName: $0.lastPathComponent) })
-        refreshStatus()
-    }
-
-    @objc private func confirmSettings() {
-        guard !isSaving else { return }
-        let name = nameField.stringValue
-        let editingIndex = selectedIndex
-        let imageURL = pendingImageURL
-        let sounds = soundDrafts
-
-        if editingIndex == nil, imageURL == nil {
-            showError("사진을 먼저 선택해 주세요.", detail: "새 말랑이를 등록하려면 말랑이 사진이 필요해요.")
-            return
-        }
-
-        setSaving(true)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result {
-                try MalangiSettings.saveMalangi(name: name, editingIndex: editingIndex, image: imageURL, sounds: sounds)
-            }
-
-            DispatchQueue.main.async {
-                self.setSaving(false)
-                switch result {
-                case .success:
-                    self.clearDraft()
-                    self.refreshStatus()
-                    self.window?.close()
-                case .failure(let error):
-                    self.showError("등록에 실패했어요.", detail: error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func refreshStatus() {
-        registrations = MalangiSettings.registrations
-        tableView.reloadData()
-        soundTableView.reloadData()
-        if let selectedIndex, registrations.indices.contains(selectedIndex) {
-            tableView.selectRowIndexes(IndexSet(integer: selectedIndex), byExtendingSelection: false)
-        }
-
-        if let pendingImageURL {
-            imageStatusLabel.stringValue = "\(pendingImageURL.lastPathComponent) 선택됨"
-            imagePreview.image = NSImage(contentsOf: pendingImageURL)
-        } else if let selectedIndex, registrations.indices.contains(selectedIndex) {
-            let registration = registrations[selectedIndex]
-            imageStatusLabel.stringValue = registration.imageFileName ?? ResourceLocator.displayName(for: registration.imagePath)
-            imagePreview.image = ResourceLocator.image(for: registration.imagePath)
-        } else {
-            imageStatusLabel.stringValue = "새 사진 선택"
-            imagePreview.image = nil
-        }
-
-        if !soundDrafts.isEmpty {
-            soundStatusLabel.stringValue = "\(soundDrafts.count)개"
-        } else {
-            soundStatusLabel.stringValue = "선택 안 함"
-        }
-
-        updateActionStates()
-        updateAuthStatus()
-    }
-
-    @objc private func selectRegistration() {
-        let row = tableView.selectedRow
-        guard registrations.indices.contains(row) else {
-            clearDraft()
-            refreshStatus()
-            return
-        }
-
-        selectedIndex = row
-        pendingImageURL = nil
-        soundDrafts = registrations[row].soundPaths.enumerated().compactMap { index, path in
-            guard let url = ResourceLocator.url(for: path) else { return nil }
-            let displayName = registrations[row].soundFileNames.indices.contains(index)
-                ? registrations[row].soundFileNames[index]
-                : ResourceLocator.displayName(for: path)
-            return SoundDraft(url: url, displayName: displayName)
-        }
-        nameField.stringValue = registrations[row].name
-        refreshStatus()
-    }
-
-    @objc private func newRegistration() {
-        tableView.deselectAll(nil)
-        clearDraft()
-        refreshStatus()
-    }
-
-    @objc private func selectSound() {
-        updateActionStates()
-    }
-
-    @objc private func deleteRegistration() {
-        guard let selectedIndex else { return }
-
-        do {
-            try MalangiSettings.deleteMalangi(at: selectedIndex)
-            clearDraft()
-            refreshStatus()
-        } catch {
-            showError("삭제에 실패했어요.", detail: error.localizedDescription)
-        }
-    }
-
-    @objc private func deleteSelectedSound() {
-        let row = soundTableView.selectedRow
-        guard soundDrafts.indices.contains(row) else { return }
-        soundDrafts.remove(at: row)
-        let nextRow = min(row, soundDrafts.count - 1)
-        refreshStatus()
-        if nextRow >= 0 {
-            soundTableView.selectRowIndexes(IndexSet(integer: nextRow), byExtendingSelection: false)
-        }
-        updateActionStates()
-    }
-
-    private func updateActionStates() {
-        deleteMalangiButton.isEnabled = selectedIndex != nil
-        deleteSoundButton.isEnabled = soundTableView.selectedRow >= 0
-        uploadMarketplaceButton.isEnabled = selectedIndex != nil && SupabaseMalangiClient.shared.authSession != nil
-        downloadMarketplaceButton.isEnabled = selectedMarketplaceIndex != nil
-    }
-
-    private func updateMode() {
-        let isMarketplace = modeControl.selectedSegment == 1
-        localContentViews.forEach { $0.isHidden = isMarketplace }
-        marketplacePanel.isHidden = !isMarketplace
-        titleLabel.stringValue = isMarketplace ? "마켓플레이스" : "말랑이 등록하기"
-        if isMarketplace, marketplaceMalangis.isEmpty {
-            refreshMarketplace()
-        }
-        refreshStatus()
-    }
-
-    private func updateAuthStatus() {
-        if let session = SupabaseMalangiClient.shared.authSession {
-            authStatusLabel.stringValue = "로그인됨: \(session.user.email ?? session.user.id)"
-            signInButton.isEnabled = false
-            signUpButton.isEnabled = false
-            signOutButton.isEnabled = true
-        } else {
-            authStatusLabel.stringValue = "업로드하려면 로그인해 주세요."
-            signInButton.isEnabled = true
-            signUpButton.isEnabled = true
-            signOutButton.isEnabled = false
-        }
-        if modeControl.selectedSegment == 1, selectedIndex == nil {
-            marketplaceStatusLabel.stringValue = marketplaceStatusLabel.stringValue.isEmpty
-                ? "내 말랑이를 선택하면 업로드 가능"
-                : marketplaceStatusLabel.stringValue
-        }
-    }
-
-    private func authenticate(isSignUp: Bool) {
-        let email = authEmailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let password = authPasswordField.stringValue
-        guard !email.isEmpty, !password.isEmpty else {
-            showError("이메일과 비밀번호를 입력해 주세요.", detail: "마켓플레이스 업로드에 사용할 계정 정보가 필요해요.")
-            return
-        }
-
-        authStatusLabel.stringValue = isSignUp ? "가입 중" : "로그인 중"
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result {
-                if isSignUp {
-                    return try SupabaseMalangiClient.shared.signUp(email: email, password: password)
-                }
-                return try SupabaseMalangiClient.shared.signIn(email: email, password: password)
-            }
-            DispatchQueue.main.async {
-                switch result {
-                case .success:
-                    self.authPasswordField.stringValue = ""
-                    self.refreshStatus()
-                case .failure(let error):
-                    self.authStatusLabel.stringValue = "인증 실패"
-                    self.showError("인증 실패", detail: error.localizedDescription)
-                }
-            }
-        }
+        viewModel.onRequestClose = { [weak self] in self?.close() }
     }
 
     func resetForPresentation() {
-        tableView.deselectAll(nil)
-        clearDraft()
-        refreshStatus()
-    }
-
-    private func clearDraft() {
-        selectedIndex = nil
-        pendingImageURL = nil
-        soundDrafts = []
-        nameField.stringValue = ""
-        imagePreview.image = nil
-    }
-
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        if tableView === soundTableView {
-            return soundDrafts.count
-        }
-        if tableView === marketplaceTableView {
-            return marketplaceMalangis.count
-        }
-
-        return registrations.count
-    }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        if tableView === soundTableView {
-            guard soundDrafts.indices.contains(row) else { return nil }
-
-            let identifier = NSUserInterfaceItemIdentifier("SoundCell")
-            let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTextField
-                ?? NSTextField(labelWithString: "")
-
-            cell.identifier = identifier
-            cell.stringValue = soundDrafts[row].displayName
-            cell.lineBreakMode = .byTruncatingMiddle
-            cell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-            return cell
-        }
-
-        if tableView === marketplaceTableView {
-            guard marketplaceMalangis.indices.contains(row) else { return nil }
-            let item = marketplaceMalangis[row]
-            let identifier = NSUserInterfaceItemIdentifier("MarketplaceCell")
-            let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTextField
-                ?? NSTextField(labelWithString: "")
-            cell.identifier = identifier
-            let author = item.ownerEmail ?? "unknown"
-            cell.stringValue = "\(item.name) · \(item.soundURLs.count) sounds · \(author)"
-            cell.lineBreakMode = .byTruncatingTail
-            cell.font = NSFont.systemFont(ofSize: 13, weight: .regular)
-            return cell
-        }
-
-        guard registrations.indices.contains(row) else { return nil }
-
-        let identifier = NSUserInterfaceItemIdentifier("MalangiCell")
-        let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTextField
-            ?? NSTextField(labelWithString: "")
-
-        cell.identifier = identifier
-        cell.stringValue = registrations[row].name
-        cell.lineBreakMode = .byTruncatingTail
-        cell.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        return cell
-    }
-
-    private func setSaving(_ saving: Bool) {
-        isSaving = saving
-        confirmButton.isEnabled = !saving
-        confirmButton.title = saving ? "저장 중" : "확인"
-
-        if saving {
-            spinner.startAnimation(nil)
-        } else {
-            spinner.stopAnimation(nil)
-        }
-    }
-
-    private func showError(_ message: String, detail: String) {
-        let alert = NSAlert()
-        alert.messageText = message
-        alert.informativeText = detail
-        alert.alertStyle = .warning
-        alert.runModal()
+        viewModel.resetForPresentation()
     }
 }
 
@@ -2082,6 +1710,13 @@ final class SoundPlayer {
         audioPlayer = try? AVAudioPlayer(data: data)
         audioPlayer?.prepareToPlay()
         audioPlayer?.play()
+    }
+
+    /// 원격 URL 포함 사운드를 백그라운드에서 미리 재생합니다 (마켓 리스트 미리듣기용).
+    func preview(_ soundName: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.playSound(named: soundName)
+        }
     }
 
     private func playSound(named soundName: String) {
@@ -2489,6 +2124,65 @@ enum ResourceLocator {
         }
 
         return url.lastPathComponent
+    }
+}
+
+// MARK: - OAuth Helpers
+
+/// PKCE(Proof Key for Code Exchange) — code_verifier + code_challenge 생성
+struct PKCE {
+    let verifier: String
+    let challenge: String
+
+    init() {
+        var bytes = [UInt8](repeating: 0, count: 64)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        verifier = Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+
+        let digest = SHA256.hash(data: Data(verifier.utf8))
+        challenge = Data(digest).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
+/// ASWebAuthenticationSession을 감싸 wazak:// 스킴 콜백을 받아 반환하는 코디네이터.
+/// 포트 점유·생명주기 문제가 없고, 취소 시 즉시 정리됩니다.
+/// 모든 메서드는 메인스레드(UI)에서 호출됩니다.
+final class WebAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextProviding {
+    private var session: ASWebAuthenticationSession?
+
+    /// 메인스레드에서 호출해야 합니다.
+    func start(url: URL, scheme: String, completion: @escaping (Result<URL, Error>) -> Void) {
+        let s = ASWebAuthenticationSession(url: url, callbackURLScheme: scheme) { callbackURL, error in
+            DispatchQueue.main.async {
+                if let callbackURL {
+                    completion(.success(callbackURL))
+                } else {
+                    completion(.failure(error ?? NSError(domain: "Wazak", code: 34,
+                        userInfo: [NSLocalizedDescriptionKey: "로그인 창에서 응답이 없어요."])))
+                }
+            }
+        }
+        s.presentationContextProvider = self
+        // false = Safari 쿠키 공유(계정 선택 편리). 구글 에러 재발 시 true로 시도.
+        s.prefersEphemeralWebBrowserSession = false
+        session = s
+        s.start()
+    }
+
+    func cancel() {
+        session?.cancel()
+        session = nil
+    }
+
+    // ASWebAuthenticationPresentationContextProviding — 항상 메인스레드에서 호출됨
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) ?? ASPresentationAnchor()
     }
 }
 
