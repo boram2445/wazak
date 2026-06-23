@@ -308,9 +308,12 @@ final class SupabaseMalangiClient {
 
     private init(session: URLSession = .shared) {
         let environment = ProcessInfo.processInfo.environment
-        let urlString = environment["SUPABASE_URL"] ?? ""
+        let bundledURLString = Bundle.main.object(forInfoDictionaryKey: "SupabaseURL") as? String
+        let bundledKey = Bundle.main.object(forInfoDictionaryKey: "SupabasePublishableKey") as? String
+        let urlString = environment["SUPABASE_URL"] ?? bundledURLString ?? ""
         let key = environment["SUPABASE_PUBLISHABLE_KEY"]
             ?? environment["SUPABASE_ANON_KEY"]
+            ?? bundledKey
             ?? ""
 
         self.baseURL = URL(string: urlString)
@@ -835,7 +838,8 @@ final class MalangiOverlayView: NSView {
     private let badgeLabel = BadgeLabel(frame: .zero)
     private let leftButton = ArrowButton(direction: .left)
     private let rightButton = ArrowButton(direction: .right)
-    private let settingsButton = SettingsButton(frame: .zero)
+    private let settingsButton = OverlaySymbolButton(symbolName: "gearshape.fill", toolTip: "설정")
+    private let quitButton = OverlaySymbolButton(symbolName: "xmark", toolTip: "앱 종료")
     private let soundPlayer = SoundPlayer()
     private var trackingAreaRef: NSTrackingArea?
     private var currentIndex = 0
@@ -859,6 +863,7 @@ final class MalangiOverlayView: NSView {
         addSubview(leftButton)
         addSubview(rightButton)
         addSubview(settingsButton)
+        addSubview(quitButton)
 
         leftButton.target = self
         leftButton.action = #selector(previousMalangi)
@@ -866,6 +871,8 @@ final class MalangiOverlayView: NSView {
         rightButton.action = #selector(nextMalangi)
         settingsButton.target = self
         settingsButton.action = #selector(showSettings)
+        quitButton.target = self
+        quitButton.action = #selector(quitApp)
 
         NotificationCenter.default.addObserver(
             self,
@@ -906,7 +913,8 @@ final class MalangiOverlayView: NSView {
 
         leftButton.frame = NSRect(x: 6, y: 122, width: 34, height: 34)
         rightButton.frame = NSRect(x: bounds.width - 40, y: 122, width: 34, height: 34)
-        settingsButton.frame = NSRect(x: bounds.width - 48, y: bounds.height - 44, width: 32, height: 32)
+        quitButton.frame = NSRect(x: bounds.width - 42, y: bounds.height - 42, width: 28, height: 28)
+        settingsButton.frame = NSRect(x: bounds.width - 72, y: bounds.height - 42, width: 28, height: 28)
     }
 
     override func updateTrackingAreas() {
@@ -961,6 +969,7 @@ final class MalangiOverlayView: NSView {
             leftButton.animator().alphaValue = isHovering ? 1 : 0
             rightButton.animator().alphaValue = isHovering ? 1 : 0
             settingsButton.animator().alphaValue = isHovering ? 1 : 0
+            quitButton.animator().alphaValue = isHovering ? 1 : 0
         }
     }
 
@@ -989,6 +998,10 @@ final class MalangiOverlayView: NSView {
 
     @objc private func showSettings() {
         SettingsPresenter.shared.show()
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 
     private func resolvedMalangi(at index: Int) -> Malangi {
@@ -1190,11 +1203,7 @@ final class BadgeLabel: NSView {
 }
 
 final class ArrowButton: NSButton {
-    enum Direction {
-        case left
-        case right
-    }
-
+    enum Direction { case left, right }
     private let direction: Direction
 
     init(direction: Direction) {
@@ -1207,37 +1216,25 @@ final class ArrowButton: NSButton {
         alphaValue = 0
         wantsLayer = true
         layer?.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
-        toolTip = direction == .left ? "Previous Malangi" : "Next Malangi"
+        toolTip = direction == .left ? "이전 말랑이" : "다음 말랑이"
     }
 
-    required init?(coder: NSCoder) {
-        nil
-    }
+    required init?(coder: NSCoder) { nil }
 
-    override var isHighlighted: Bool {
-        didSet {
-            needsDisplay = true
-        }
-    }
+    override var isHighlighted: Bool { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         let circleRect = bounds.insetBy(dx: 1, dy: 1)
         let circle = NSBezierPath(ovalIn: circleRect)
-        let fillAlpha: CGFloat = isHighlighted ? 0.98 : 0.88
-
-        NSColor(calibratedWhite: 1, alpha: fillAlpha).setFill()
+        NSColor(calibratedWhite: 1, alpha: isHighlighted ? 0.98 : 0.88).setFill()
         circle.fill()
-
         NSColor(calibratedWhite: 0, alpha: 0.12).setStroke()
         circle.lineWidth = 1
         circle.stroke()
 
         let chevron = NSBezierPath()
-        let midX = bounds.midX
-        let midY = bounds.midY
-        let spread: CGFloat = 5.2
-        let reach: CGFloat = 3.8
-
+        let midX = bounds.midX, midY = bounds.midY
+        let spread: CGFloat = 5.2, reach: CGFloat = 3.8
         if direction == .left {
             chevron.move(to: NSPoint(x: midX + reach, y: midY + spread))
             chevron.line(to: NSPoint(x: midX - reach, y: midY))
@@ -1247,72 +1244,52 @@ final class ArrowButton: NSButton {
             chevron.line(to: NSPoint(x: midX + reach, y: midY))
             chevron.line(to: NSPoint(x: midX - reach, y: midY - spread))
         }
-
         chevron.lineWidth = 2.0
         chevron.lineCapStyle = .round
         chevron.lineJoinStyle = .round
         NSColor(calibratedWhite: 0.12, alpha: 0.94).setStroke()
         chevron.stroke()
     }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
 }
 
-final class SettingsButton: NSButton {
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
+final class OverlaySymbolButton: NSButton {
+    private let tintColor: NSColor
+
+    init(symbolName: String, toolTip: String, tintColor: NSColor = NSColor(calibratedWhite: 0.5, alpha: 1)) {
+        self.tintColor = tintColor
+        super.init(frame: .zero)
         title = ""
         bezelStyle = .shadowlessSquare
         isBordered = false
         focusRingType = .none
         alphaValue = 0
         wantsLayer = true
+        layer?.shadowOpacity = 0
+        layer?.borderWidth = 0
+        layer?.backgroundColor = NSColor.clear.cgColor
         layer?.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
-        toolTip = "Settings"
+        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: toolTip)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)) {
+            img.isTemplate = true
+            image = img
+        }
+        imagePosition = .imageOnly
+        contentTintColor = tintColor
+        self.toolTip = toolTip
     }
 
-    required init?(coder: NSCoder) {
-        nil
-    }
+    required init?(coder: NSCoder) { nil }
 
     override var isHighlighted: Bool {
-        didSet {
-            needsDisplay = true
-        }
+        didSet { contentTintColor = tintColor.withAlphaComponent(isHighlighted ? 1 : 0.85) }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        drawGear(in: bounds.insetBy(dx: 7, dy: 7))
-    }
-
-    private func drawGear(in rect: NSRect) {
-        let center = NSPoint(x: rect.midX, y: rect.midY)
-        let path = NSBezierPath()
-        let teeth = 8
-        let outerRadius = min(rect.width, rect.height) / 2
-        let innerRadius = outerRadius * 0.72
-
-        for index in 0..<(teeth * 2) {
-            let angle = (Double(index) / Double(teeth * 2)) * Double.pi * 2 - Double.pi / 2
-            let radius = index.isMultiple(of: 2) ? outerRadius : innerRadius
-            let point = NSPoint(
-                x: center.x + CGFloat(cos(angle)) * radius,
-                y: center.y + CGFloat(sin(angle)) * radius
-            )
-
-            if index == 0 {
-                path.move(to: point)
-            } else {
-                path.line(to: point)
-            }
-        }
-
-        path.close()
-        NSColor(calibratedWhite: isHighlighted ? 0.32 : 0.48, alpha: 0.95).setFill()
-        path.fill()
-
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current?.compositingOperation = .clear
-        NSBezierPath(ovalIn: NSRect(x: center.x - 2.6, y: center.y - 2.6, width: 5.2, height: 5.2)).fill()
-        NSGraphicsContext.restoreGraphicsState()
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }
 

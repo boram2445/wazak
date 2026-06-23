@@ -749,6 +749,7 @@ struct SettingsRootView: View {
             }
             .padding(4)
             .background(Capsule().fill(Color.black.opacity(0.06)))
+
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 14)
@@ -1533,7 +1534,7 @@ private struct BundleImage: View {
     let `extension`: String
 
     var body: some View {
-        if let url = Bundle.module.url(forResource: name, withExtension: `extension`),
+        if let url = ResourceLocator.url(for: "\(name).\(`extension`)"),
            let image = NSImage(contentsOf: url) {
             Image(nsImage: image)
                 .resizable()

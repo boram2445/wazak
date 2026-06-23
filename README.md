@@ -35,6 +35,36 @@ Wazak이 이미 실행 중이라면, 메뉴 바의 `와` 항목에서 먼저 종
 swift build   # 테스트 타겟 없음
 ```
 
+### 배포용 앱 패키징
+
+```sh
+./scripts/package-app.sh
+```
+
+위 명령은 `swift build -c release` 후 macOS 앱 번들을 만들고 zip으로 묶습니다.
+
+생성물:
+
+```txt
+dist/Wazak.app
+dist/Wazak.zip
+```
+
+`Wazak.zip`을 공유하면 사용자는 압축을 풀고 `Wazak.app`을 실행할 수 있습니다.  
+패키징 시 `.env`의 `SUPABASE_URL`과 `SUPABASE_PUBLISHABLE_KEY` 값이 앱의 `Info.plist`에 포함되어, 더블클릭 실행에서도 로그인과 마켓플레이스 기능이 동작합니다.
+
+OAuth redirect를 위해 Supabase Dashboard → Authentication → URL Configuration → Redirect URLs에 아래 값을 추가해야 합니다.
+
+```txt
+wazak://auth/callback
+```
+
+기본 패키징은 ad-hoc 서명입니다. 외부 사용자에게 경고를 줄여 배포하려면 Apple Developer ID 인증서로 서명하세요.
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/package-app.sh
+```
+
 ---
 
 ## 환경 변수 (`.env`)
