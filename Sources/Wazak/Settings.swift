@@ -20,6 +20,12 @@ enum SettingsMode {
     case marketplace
 }
 
+enum MarketplaceFilter: String, CaseIterable {
+    case all = "전체"
+    case builtIn = "기본 제공"
+    case shared = "마켓"
+}
+
 struct SettingsAlert: Identifiable {
     let id = UUID()
     let title: String
@@ -61,7 +67,9 @@ enum MarketplaceItem: Identifiable {
     var subtitle: String {
         switch self {
         case .builtIn: return "기본 제공"
-        case .shared(let m): return "\(m.soundURLs.count) sounds · \(m.ownerName ?? "익명")"
+        case .shared(let m):
+            let owner = m.ownerName.map { "@\($0)" } ?? "익명"
+            return "\(m.soundURLs.count) sounds · \(owner)"
         }
     }
 
@@ -291,15 +299,20 @@ final class SettingsViewModel: ObservableObject {
     func refreshMarketplace() {
         marketplaceStatusText = "불러오는 중"
         DispatchQueue.global(qos: .utility).async {
-            let result = Result { try SupabaseMalangiClient.shared.fetchMarketplace() }
+            let marketplaceResult = Result { try SupabaseMalangiClient.shared.fetchMarketplace() }
+            // malangis 기본 카탈로그도 함께 갱신
+            if let catalog = try? SupabaseMalangiClient.shared.fetchAll() {
+                MalangiSettings.updateRemoteCatalog(catalog)
+            }
             DispatchQueue.main.async {
-                switch result {
+                self.defaultCatalog = MalangiSettings.defaultCatalog
+                switch marketplaceResult {
                 case .success(let rows):
                     self.marketplaceMalangis = rows
+                    self.reconcilePublishedMarketplaceIds(rows)
                     self.didLoadMarketplace = true
-                    let total = self.marketplaceItems.count
-                    self.marketplaceStatusText = total > 0 ? "\(total)개" : ""
-                    self.refreshPoints()    // 마켓 새로고침 시 잔액도 갱신
+                    self.marketplaceStatusText = ""
+                    self.refreshPoints()
                 case .failure(let error):
                     self.marketplaceStatusText = "조회 실패"
                     self.alert = SettingsAlert(title: "마켓 조회 실패",
@@ -326,6 +339,7 @@ final class SettingsViewModel: ObservableObject {
             return
         }
         let malangi = registrations[idx]
+        let wasPublished = marketplaceId(for: malangi) != nil
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result {
                 try SupabaseMalangiClient.shared.publishToMarketplace(malangi, session: session)
@@ -336,7 +350,7 @@ final class SettingsViewModel: ObservableObject {
                     MalangiSettings.setMarketplaceId(row.id, for: malangi)
                     self.reload()
                     self.refreshPoints()    // 업로드 트리거 +3 반영
-                    let verb = malangi.marketplaceId != nil ? "갱신" : "업로드"
+                    let verb = wasPublished ? "갱신" : "업로드"
                     self.alert = SettingsAlert(title: "마켓 \(verb) 완료",
                                               detail: "'\(malangi.name)'이(가) 마켓플레이스에 \(verb)됐어요.")
                 case .failure(let error):
@@ -345,6 +359,62 @@ final class SettingsViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func unpublish() {
+        guard let idx = selectedIndex, registrations.indices.contains(idx) else {
+            alert = SettingsAlert(title: "말랑이를 선택해 주세요.",
+                                  detail: "마켓에서 내릴 말랑이를 먼저 선택해 주세요.")
+            return
+        }
+        guard let session = SupabaseMalangiClient.shared.authSession else {
+            alert = SettingsAlert(title: "로그인이 필요해요.",
+                                  detail: "마켓에서 내리려면 먼저 로그인해 주세요.")
+            return
+        }
+
+        let malangi = registrations[idx]
+        guard let marketplaceId = marketplaceId(for: malangi) else {
+            alert = SettingsAlert(title: "마켓 항목을 찾을 수 없어요.",
+                                  detail: "마켓을 새로고침한 뒤 다시 시도해 주세요.")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result {
+                try SupabaseMalangiClient.shared.unpublishMarketplaceMalangi(id: marketplaceId, session: session)
+            }
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    MalangiSettings.setMarketplaceId(nil, for: malangi)
+                    self.marketplaceMalangis.removeAll { $0.id == marketplaceId }
+                    self.reload()
+                    self.alert = SettingsAlert(title: "마켓에서 내렸어요.",
+                                               detail: "'\(malangi.name)'이(가) 더 이상 마켓에 표시되지 않아요.")
+                case .failure(let error):
+                    self.alert = SettingsAlert(title: "마켓에서 내리기 실패",
+                                               detail: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func marketplaceId(for malangi: StoredMalangi) -> String? {
+        if let id = malangi.marketplaceId { return id }
+        if let matchingLocalId = registrations.first(where: {
+            $0.marketplaceId != nil && Self.sameLocalMalangi($0, malangi)
+        })?.marketplaceId {
+            return matchingLocalId
+        }
+        guard let ownerId = SupabaseMalangiClient.shared.authSession?.user.id else { return nil }
+        return marketplaceMalangis.first {
+            $0.ownerId == ownerId && $0.name == malangi.name
+        }?.id
+    }
+
+    func isPublishedToMarketplace(_ malangi: StoredMalangi) -> Bool {
+        marketplaceId(for: malangi) != nil
     }
 
     func isDownloaded(_ item: MarketplaceItem) -> Bool {
@@ -359,7 +429,10 @@ final class SettingsViewModel: ObservableObject {
     func download(_ item: MarketplaceItem) {
         // 이미 "내 말랑이"에 있으면 과금/로그인 전에 먼저 조기 반환
         if isDownloaded(item) {
-            marketplaceStatusText = "이미 추가됨"
+            alert = SettingsAlert(
+                title: "이미 추가됨",
+                detail: "이 말랑이는 이미 내 말랑이에 있어요."
+            )
             return
         }
         switch item {
@@ -521,6 +594,16 @@ final class SettingsViewModel: ObservableObject {
         selectedIndex = nil
         clearDraft()
         reload()
+        refreshPoints()
+        refreshSessionIfNeeded()   // avatar_url 등 세션 메타데이터 갱신
+    }
+
+    private func refreshSessionIfNeeded() {
+        guard isSignedIn else { return }
+        DispatchQueue.global(qos: .utility).async {
+            try? SupabaseMalangiClient.shared.refreshUserSession()
+            DispatchQueue.main.async { self.objectWillChange.send() }
+        }
     }
 
     // MARK: - Private
@@ -548,6 +631,39 @@ final class SettingsViewModel: ObservableObject {
         soundStatusText = soundDrafts.isEmpty ? "선택 안 함" : "\(soundDrafts.count)개"
     }
 
+    private func reconcilePublishedMarketplaceIds(_ rows: [MarketplaceMalangi]) {
+        guard let ownerId = SupabaseMalangiClient.shared.authSession?.user.id else { return }
+        let ownedRows = rows.filter { $0.ownerId == ownerId }
+        guard !ownedRows.isEmpty else { return }
+
+        var didUpdate = false
+        for registration in registrations where !registration.isDefault && registration.marketplaceId == nil {
+            guard let row = ownedRows.first(where: { $0.name == registration.name }) else { continue }
+            MalangiSettings.setMarketplaceId(row.id, for: registration)
+            didUpdate = true
+        }
+
+        if didUpdate {
+            reload()
+        }
+    }
+
+    private static func sameLocalMalangi(_ lhs: StoredMalangi, _ rhs: StoredMalangi) -> Bool {
+        if lhs.imagePath == rhs.imagePath { return true }
+        return lhs.name == rhs.name && lhs.imageFileName == rhs.imageFileName
+    }
+
+    /// 계정 칩에 표시할 이름 (닉네임 → 이메일 → "내 계정" 폴백).
+    var accountName: String {
+        let u = SupabaseMalangiClient.shared.authSession?.user
+        return u?.userMetadata?.displayName ?? u?.email ?? "내 계정"
+    }
+
+    /// 구글 프로필 사진 URL (avatar_url → picture 순서 폴백).
+    var avatarURLString: String? {
+        SupabaseMalangiClient.shared.authSession?.user.userMetadata?.avatarURLString
+    }
+
     private func updateAuthStatus() {
         if let session = SupabaseMalangiClient.shared.authSession {
             let name = session.user.userMetadata?.displayName ?? session.user.email ?? session.user.id
@@ -562,6 +678,7 @@ final class SettingsViewModel: ObservableObject {
 
 struct SettingsRootView: View {
     @ObservedObject var viewModel: SettingsViewModel
+    @State private var showTips = false
 
     var body: some View {
         ZStack {
@@ -608,6 +725,22 @@ struct SettingsRootView: View {
                 .font(.system(size: 18, weight: .bold, design: .rounded))
 
             Spacer()
+
+            // 도움말 버튼 — 탭 스위처 좌측 (등록 탭에서만 표시)
+            if viewModel.mode == .local {
+                Button {
+                    showTips = true
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 15))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .pointingCursor()
+                .popover(isPresented: $showTips, arrowEdge: .bottom) {
+                    RegistrationTipsView()
+                }
+            }
 
             // Pill-style tab switcher
             HStack(spacing: 2) {
@@ -713,7 +846,7 @@ struct LoginSheetView: View {
                         MalangiButton(title: "취소", style: .secondary) {
                             viewModel.showLoginSheet = false
                         }
-                        MalangiButton(title: "Google로 로그인", style: .primary) {
+                        MalangiButton(title: "Google로 로그인", style: .primary, iconName: "google-logo") {
                             viewModel.signInWithGoogle()
                         }
                     }
@@ -722,6 +855,46 @@ struct LoginSheetView: View {
         }
         .padding(32)
         .frame(minWidth: 340)
+        .background(MalangiTheme.background)
+    }
+}
+
+// MARK: - Registration Tips Popover
+
+struct RegistrationTipsView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("💡 말랑이 만들기 팁")
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+
+            // 사진 섹션
+            VStack(alignment: .leading, spacing: 6) {
+                sectionLabel("📸 말랑이 사진")
+                Text("실제 사진을 GPT에 제공하고 말랑이 사진으로 만들어달라고 하세요.\n아래 사이트에서 배경없는 이미지를 준비해주세요.")
+                    .font(.system(size: 13, design: .rounded))
+                    .foregroundColor(.primary.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+                Link("🔗 remove.bg에서 배경 제거하기",
+                     destination: URL(string: "https://www.remove.bg/ko")!)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundColor(MalangiTheme.accentBlue.opacity(0.9))
+            }
+
+            // 소리 섹션
+            VStack(alignment: .leading, spacing: 6) {
+                sectionLabel("🎵 말랑이 소리")
+                Text("말랑이가 반응할 때 재생할 소리를\n적당한 길이로 잘라서 준비하세요.")
+                    .font(.system(size: 13, design: .rounded))
+                    .foregroundColor(.primary.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+                Link("🔗 vocalremover에서 소리 자르기",
+                     destination: URL(string: "https://vocalremover.org/ko/cutter")!)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundColor(MalangiTheme.accentBlue.opacity(0.9))
+            }
+        }
+        .padding(20)
+        .frame(width: 300)
         .background(MalangiTheme.background)
     }
 }
@@ -764,8 +937,8 @@ struct LocalTabView: View {
                                     .background(Capsule().fill(MalangiTheme.accentBlue.opacity(0.25)))
                                     .foregroundColor(.secondary)
                             }
-                            if reg.marketplaceId != nil {
-                                Text("✓ 업로드됨")
+                            if viewModel.isPublishedToMarketplace(reg) {
+                                Text("마켓")
                                     .font(.system(size: 10, weight: .bold, design: .rounded))
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
@@ -820,6 +993,7 @@ struct LocalTabView: View {
                 MalangiButton(title: "말랑이 사진 등록", style: .secondary) {
                     viewModel.selectImage()
                 }
+                .disabled(viewModel.selectedIsDefault)
                 Text(viewModel.imageStatusText)
                     .font(.system(size: 12, design: .rounded))
                     .foregroundColor(.secondary)
@@ -834,6 +1008,7 @@ struct LocalTabView: View {
                 MalangiButton(title: "사운드 여러 개 등록", style: .secondary) {
                     viewModel.selectSounds()
                 }
+                .disabled(viewModel.selectedIsDefault)
                 Text(viewModel.soundStatusText)
                     .font(.system(size: 12, design: .rounded))
                     .foregroundColor(.secondary)
@@ -883,40 +1058,51 @@ struct LocalTabView: View {
 
             // Bottom actions
             HStack {
-                MalangiButton(title: "사운드 삭제", style: .secondary, isDestructive: true) {
-                    if let idx = viewModel.selectedSoundIndex {
-                        viewModel.deleteSound(at: idx)
+                // 기본 말랑이는 사운드 삭제 숨김
+                if !viewModel.selectedIsDefault {
+                    MalangiButton(title: "사운드 삭제", style: .secondary, isDestructive: true) {
+                        if let idx = viewModel.selectedSoundIndex {
+                            viewModel.deleteSound(at: idx)
+                        }
                     }
+                    .disabled(!viewModel.canDeleteSound)
                 }
-                .disabled(!viewModel.canDeleteSound)
 
                 Spacer()
 
-                // 마켓 업로드/갱신 버튼 (기본 말랑이는 숨김)
+                // 마켓 업로드/내리기 버튼 (기본 말랑이는 숨김)
                 if let idx = viewModel.selectedIndex,
                    viewModel.registrations.indices.contains(idx),
                    !viewModel.selectedIsDefault {
-                    let isPublished = viewModel.registrations[idx].marketplaceId != nil
+                    let isPublished = viewModel.isPublishedToMarketplace(viewModel.registrations[idx])
                     MalangiButton(
-                        title: isPublished ? "마켓 갱신" : "마켓에 올리기",
-                        style: .secondary
+                        title: isPublished ? "마켓에서 내리기" : "마켓에 올리기",
+                        style: .secondary,
+                        isDestructive: isPublished
                     ) {
-                        viewModel.upload()
+                        if isPublished {
+                            viewModel.unpublish()
+                        } else {
+                            viewModel.upload()
+                        }
                     }
                     .disabled(viewModel.isSaving)
                 }
 
-                if viewModel.isSaving {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(0.7)
-                        .padding(.trailing, 4)
+                // 기본 말랑이는 확인 버튼 숨김
+                if !viewModel.selectedIsDefault {
+                    if viewModel.isSaving {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.7)
+                            .padding(.trailing, 4)
+                    }
+                    MalangiButton(title: viewModel.isSaving ? "저장 중…" : "확인",
+                                  style: .primary) {
+                        viewModel.confirm()
+                    }
+                    .disabled(viewModel.isSaving)
                 }
-                MalangiButton(title: viewModel.isSaving ? "저장 중…" : "확인",
-                              style: .primary) {
-                    viewModel.confirm()
-                }
-                .disabled(viewModel.isSaving || viewModel.selectedIsDefault)
             }
         }
         .malangiCard()
@@ -947,6 +1133,16 @@ struct LocalTabView: View {
 
 struct MarketplaceTabView: View {
     @ObservedObject var viewModel: SettingsViewModel
+    @State private var showAccountMenu = false
+    @State private var marketplaceFilter: MarketplaceFilter = .all
+
+    private var filteredItems: [MarketplaceItem] {
+        switch marketplaceFilter {
+        case .all:     return viewModel.marketplaceItems
+        case .builtIn: return viewModel.marketplaceItems.filter { $0.isBuiltIn }
+        case .shared:  return viewModel.marketplaceItems.filter { !$0.isBuiltIn }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 10) {
@@ -960,26 +1156,115 @@ struct MarketplaceTabView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private func filterPill(_ filter: MarketplaceFilter) -> some View {
+        Button { marketplaceFilter = filter } label: {
+            Text(filter.rawValue)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule()
+                        .fill(marketplaceFilter == filter
+                              ? MalangiTheme.accentPink
+                              : Color.clear)
+                )
+                .foregroundColor(marketplaceFilter == filter ? .white : .secondary)
+        }
+        .buttonStyle(.plain)
+        .pointingCursor()
+    }
+
     private var actionsBar: some View {
         HStack(spacing: 8) {
-            MalangiButton(title: "새로고침", style: .secondary) { viewModel.refreshMarketplace() }
+            // 좌측: 필터 pill 그룹
+            HStack(spacing: 2) {
+                filterPill(.all)
+                filterPill(.builtIn)
+                filterPill(.shared)
+            }
+            .padding(4)
+            .background(Capsule().fill(Color.black.opacity(0.06)))
+
+            // 새로고침 + 목록 개수
+            Button {
+                viewModel.refreshMarketplace()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .padding(5)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.05)))
+            }
+            .buttonStyle(.plain)
+            .pointingCursor()
+            .help("새로고침")
+            if viewModel.didLoadMarketplace {
+                Text("총 \(filteredItems.count)개")
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundColor(.secondary)
+            }
+
             Spacer()
-            Text(viewModel.marketplaceStatusText)
-                .font(.system(size: 12, design: .rounded))
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-            if viewModel.isSignedIn {
-                Text(viewModel.authStatusText)
-                    .font(.system(size: 11, design: .rounded))
+
+            // 일시 상태 메시지 (다운로드 중… / 포인트 부족 / 조회 실패 등)
+            if !viewModel.marketplaceStatusText.isEmpty {
+                Text(viewModel.marketplaceStatusText)
+                    .font(.system(size: 12, design: .rounded))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-                if let p = viewModel.points {
-                    Text("🍬 \(p)P")
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundColor(MalangiTheme.accentPink)
+            }
+
+            if viewModel.isSignedIn {
+                // 계정 칩: 아이콘 + 닉네임 + 포인트 슬롯
+                HStack(spacing: 6) {
+                    if let urlStr = viewModel.avatarURLString, let url = URL(string: urlStr) {
+                        AsyncImage(url: url) { phase in
+                            switch phase {
+                            case .success(let img):
+                                img.resizable()
+                                    .scaledToFill()
+                                    .frame(width: 24, height: 24)
+                                    .clipShape(Circle())
+                            default:
+                                Image(systemName: "person.crop.circle.fill")
+                                    .font(.system(size: 20))
+                                    .foregroundColor(MalangiTheme.accentPink)
+                            }
+                        }
+                        .frame(width: 24, height: 24)
+                    } else {
+                        Image(systemName: "person.crop.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundColor(MalangiTheme.accentPink)
+                    }
+                    Text(viewModel.accountName)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    if let p = viewModel.points {
+                        Text("· 🍬 \(p)P")
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .foregroundColor(MalangiTheme.accentPink)
+                    } else {
+                        Text("· 🍬 —")
+                            .font(.system(size: 14, design: .rounded))
+                            .foregroundColor(.secondary)
+                    }
                 }
-                MalangiButton(title: "닉네임 변경", style: .secondary) { viewModel.editNickname() }
-                MalangiButton(title: "로그아웃", style: .secondary) { viewModel.signOut() }
+
+                // ▾ 커스텀 popover 트리거 (네이티브 Menu 폐기 → 이중 화살표 해소)
+                Button { showAccountMenu.toggle() } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .padding(6)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.05)))
+                }
+                .buttonStyle(.plain)
+                .pointingCursor()
+                .popover(isPresented: $showAccountMenu, arrowEdge: .bottom) {
+                    accountMenuContent
+                }
             } else {
                 MalangiButton(title: "로그인", style: .primary) { viewModel.openLogin() }
             }
@@ -987,25 +1272,67 @@ struct MarketplaceTabView: View {
         .malangiCard()
     }
 
+    // 스타일된 계정 popover 콘텐츠
+    private var accountMenuContent: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            accountMenuItem(label: "닉네임 변경", icon: "pencil", destructive: false) {
+                showAccountMenu = false
+                viewModel.editNickname()
+            }
+            Divider().padding(.horizontal, 4)
+            accountMenuItem(label: "로그아웃", icon: "rectangle.portrait.and.arrow.right", destructive: true) {
+                showAccountMenu = false
+                viewModel.signOut()
+            }
+        }
+        .padding(6)
+        .frame(width: 160)
+    }
+
+    private func accountMenuItem(label: String, icon: String, destructive: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+                    .foregroundColor(destructive ? .red : .primary)
+                    .frame(width: 16)
+                Text(label)
+                    .font(.system(size: 13, design: .rounded))
+                    .foregroundColor(destructive ? .red : .primary)
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(destructive
+                          ? Color.red.opacity(0.07)
+                          : MalangiTheme.accentPink.opacity(0.10))
+            )
+        }
+        .buttonStyle(.plain)
+        .pointingCursor()
+    }
+
     private var listCard: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // 비로그인 안내 배너
-            if !viewModel.isSignedIn {
-                HStack(spacing: 6) {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(MalangiTheme.accentPink)
-                    Text("기본 말랑이는 무료예요. 공유 말랑이 다운로드는 로그인 + 1포인트, 업로드하면 +3포인트!")
-                        .font(.system(size: 11, design: .rounded))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 8)
-                .padding(.top, 4)
+            // 안내 배너 — 항상 표시, 로그인 상태별 문구 분기
+            HStack(spacing: 6) {
+                Image(systemName: viewModel.isSignedIn ? "info.circle" : "lock.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(MalangiTheme.accentPink)
+                Text(viewModel.isSignedIn
+                     ? "기본 말랑이는 무료예요. 공유 말랑이 다운로드는 -1포인트, 업로드하면 +3포인트!"
+                     : "공유 말랑이를 다운로드하려면 로그인이 필요해요. (기본 말랑이는 무료!)")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(.secondary)
             }
+            .padding(.horizontal, 8)
+            .padding(.top, 4)
 
             ScrollView {
                 VStack(spacing: 2) {
-                    if viewModel.marketplaceItems.isEmpty {
+                    if filteredItems.isEmpty {
                         Text(viewModel.didLoadMarketplace
                              ? "아직 등록된 말랑이들이 없어요."
                              : "새로고침을 눌러 말랑이를 불러오세요.")
@@ -1014,7 +1341,7 @@ struct MarketplaceTabView: View {
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.vertical, 24)
                     } else {
-                        ForEach(Array(viewModel.marketplaceItems.enumerated()), id: \.offset) { index, item in
+                        ForEach(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
                             HStack(spacing: 10) {
                                 // 좌측 — 말랑이 썸네일 (비동기 로드)
                                 MarketplaceThumbnail(urlString: item.imageURLString)
@@ -1120,8 +1447,8 @@ struct MarketplaceThumbnail: View {
             }
         }
         .task(id: urlString) {
-            guard image == nil else { return }
-            // Data를 백그라운드에서 로드해 Sendable 경고 회피 (NSImage는 macOS 14+에서만 Sendable)
+            // urlString 변경 시 항상 리셋하고 새로 로드 (필터 전환 시 stale 이미지 방지)
+            await MainActor.run { self.image = nil }
             let data = await Task.detached(priority: .utility) { () -> Data? in
                 guard let url = ResourceLocator.url(for: urlString) else { return nil }
                 return try? Data(contentsOf: url)
@@ -1159,7 +1486,10 @@ struct MalangiButton: View {
     let title: String
     let style: MalangiButtonStyle
     var isDestructive: Bool = false
+    var iconName: String? = nil
     let action: () -> Void
+
+    @Environment(\.isEnabled) private var isEnabled
 
     private var fillColor: Color {
         if isDestructive { return Color.red.opacity(0.1) }
@@ -1179,15 +1509,36 @@ struct MalangiButton: View {
 
     var body: some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .foregroundColor(foreColor)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 7)
-                .background(Capsule().fill(fillColor))
+            HStack(spacing: 6) {
+                if let iconName {
+                    BundleImage(name: iconName, extension: "png")
+                        .frame(width: 16, height: 16)
+                }
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+            }
+            .foregroundColor(foreColor)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(Capsule().fill(fillColor))
         }
         .buttonStyle(.plain)
+        .opacity(isEnabled ? 1 : 0.4)
         .pointingCursor()
+    }
+}
+
+private struct BundleImage: View {
+    let name: String
+    let `extension`: String
+
+    var body: some View {
+        if let url = Bundle.module.url(forResource: name, withExtension: `extension`),
+           let image = NSImage(contentsOf: url) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+        }
     }
 }
 

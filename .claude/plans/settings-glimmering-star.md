@@ -33,10 +33,23 @@ AppKit 그대로 유지한다.
 
 ---
 
+## 파일 구성
+
+새 파일 **`Sources/Wazak/Settings.swift`** 생성 (SwiftPM가 디렉터리 전체를 자동 컴파일 → `Package.swift` 수정 불필요).
+
+| 위치 | 내용 |
+|---|---|
+| `Settings.swift` (신규) | `import SwiftUI` + `MalangiTheme`, `SettingsMode`, `SettingsAlert`, `SettingsViewModel`, `SettingsRootView`/`LocalTabView`/`MarketplaceTabView` |
+| `main.swift` (수정) | `SettingsWindow` init 교체, `SettingsPresenter.show()` 수정, 기존 `SettingsView`(1431–2070) 삭제 |
+
+`SettingsWindow`/`SettingsPresenter`는 모델·메뉴와 엮여 있어 `main.swift`에 유지. 기존 ~640줄 `SettingsView` 삭제로 `main.swift`는 오히려 가벼워짐.
+
+---
+
 ## 구현 계획
 
-### 1단계: SwiftUI import 추가
-main.swift 상단에 `import SwiftUI` 추가 (AppKit과 공존 가능).
+### 1단계: `Settings.swift` 생성 + `import SwiftUI`
+새 파일을 만들고 상단에 `import SwiftUI`, `import AppKit` 추가.
 
 ---
 

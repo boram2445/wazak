@@ -183,15 +183,21 @@ struct SupabaseUserMetadata: Codable {
     let nickname: String?   // 우리가 저장한 닉네임 (우선)
     let fullName: String?   // 구글 full_name
     let name: String?       // 구글 name (fallback)
+    let avatarURL: String?  // 구글 avatar_url
+    let picture: String?    // 구글 picture (fallback)
 
     private enum CodingKeys: String, CodingKey {
         case nickname
         case fullName = "full_name"
         case name
+        case avatarURL = "avatar_url"
+        case picture
     }
 
     /// 마켓/UI에 표시할 최종 이름: 닉네임 > 구글 full_name > 구글 name
     var displayName: String? { nickname ?? fullName ?? name }
+    /// 구글 프로필 사진 URL: avatar_url → picture 순서 폴백
+    var avatarURLString: String? { avatarURL ?? picture }
 }
 
 struct SupabaseUser: Codable {
@@ -476,6 +482,28 @@ final class SupabaseMalangiClient {
         return session
     }
 
+    /// DB에서 최신 user 정보(avatar_url 등)를 가져와 저장된 세션을 갱신합니다.
+    func refreshUserSession() throws {
+        guard let session = authSession else { return }
+        var request = try makeRequest(path: "/auth/v1/user", accessToken: session.accessToken)
+        request.httpMethod = "GET"
+        let freshUser: SupabaseUser = try perform(request)
+        // PUT 응답이 avatar 등을 누락할 수 있으므로 기존 값으로 보완
+        let prev = session.user.userMetadata
+        let merged = SupabaseUserMetadata(
+            nickname: freshUser.userMetadata?.nickname ?? prev?.nickname,
+            fullName: freshUser.userMetadata?.fullName ?? prev?.fullName,
+            name: freshUser.userMetadata?.name ?? prev?.name,
+            avatarURL: freshUser.userMetadata?.avatarURL ?? prev?.avatarURL,
+            picture: freshUser.userMetadata?.picture ?? prev?.picture
+        )
+        saveAuthSession(SupabaseAuthSession(
+            accessToken: session.accessToken,
+            refreshToken: session.refreshToken,
+            user: SupabaseUser(id: freshUser.id, email: freshUser.email ?? session.user.email, userMetadata: merged)
+        ))
+    }
+
     /// 닉네임을 Supabase user_metadata에 저장합니다.
     func updateNickname(_ nickname: String) throws {
         guard let session = authSession else { return }
@@ -485,10 +513,19 @@ final class SupabaseMalangiClient {
         request.httpBody = try encoder.encode(Body(data: ["nickname": nickname]))
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let user: SupabaseUser = try perform(request)
+        // PUT 응답이 Google avatar 등 OAuth 메타데이터를 누락할 수 있으므로 기존 값 보존
+        let prev = session.user.userMetadata
+        let merged = SupabaseUserMetadata(
+            nickname: user.userMetadata?.nickname ?? prev?.nickname,
+            fullName: user.userMetadata?.fullName ?? prev?.fullName,
+            name: user.userMetadata?.name ?? prev?.name,
+            avatarURL: user.userMetadata?.avatarURL ?? prev?.avatarURL,
+            picture: user.userMetadata?.picture ?? prev?.picture
+        )
         saveAuthSession(SupabaseAuthSession(
             accessToken: session.accessToken,
             refreshToken: session.refreshToken,
-            user: user
+            user: SupabaseUser(id: user.id, email: user.email ?? session.user.email, userMetadata: merged)
         ))
     }
 
@@ -534,6 +571,18 @@ final class SupabaseMalangiClient {
         return try perform(request)
     }
 
+    func unpublishMarketplaceMalangi(id: String, session: SupabaseAuthSession) throws {
+        guard isConfigured else {
+            throw NSError(domain: "Wazak", code: 20, userInfo: [NSLocalizedDescriptionKey: "Supabase 환경변수가 필요해요."])
+        }
+
+        var request = try makeRequest(path: "/rest/v1/marketplace_malangis", queryItems: [
+            URLQueryItem(name: "id", value: "eq.\(id)")
+        ], accessToken: session.accessToken)
+        request.httpMethod = "DELETE"
+        _ = try performRaw(request)
+    }
+
     func publishToMarketplace(_ malangi: StoredMalangi, session: SupabaseAuthSession) throws -> MarketplaceMalangi {
         guard isConfigured else {
             throw NSError(domain: "Wazak", code: 20, userInfo: [NSLocalizedDescriptionKey: "Supabase 환경변수가 필요해요."])
@@ -570,7 +619,27 @@ final class SupabaseMalangiClient {
         let selectQuery = URLQueryItem(name: "select", value: "id,owner_id,owner_email,owner_name,name,image_url,image_file_name,sound_urls,sound_file_names,downloads_count")
 
         var request: URLRequest
-        if let existingId = malangi.marketplaceId {
+        // marketplaceId가 nil이더라도 서버에 이미 같은 owner+name 행이 있으면 PATCH 경로 사용 (중복 방지)
+        let resolvedMarketplaceId: String? = malangi.marketplaceId ?? {
+            let checkRequest = try? makeRequest(
+                path: "/rest/v1/marketplace_malangis",
+                queryItems: [
+                    URLQueryItem(name: "owner_id", value: "eq.\(session.user.id)"),
+                    URLQueryItem(name: "name", value: "eq.\(malangi.name)"),
+                    URLQueryItem(name: "select", value: "id"),
+                    URLQueryItem(name: "limit", value: "1")
+                ],
+                accessToken: session.accessToken
+            )
+            if let req = checkRequest,
+               let existing: [[String: String]] = try? perform(req),
+               let firstId = existing.first?["id"] {
+                return firstId
+            }
+            return nil
+        }()
+
+        if let existingId = resolvedMarketplaceId {
             // 이미 게시된 말랑이 → PATCH로 갱신
             request = try makeRequest(path: "/rest/v1/marketplace_malangis", queryItems: [
                 URLQueryItem(name: "id", value: "eq.\(existingId)"),
@@ -1254,7 +1323,6 @@ enum MalangiSettings {
     private static let remoteMalangisKey = "malangi.remoteMalangis"
     private static let hiddenDefaultsKey = "malangi.hiddenDefaults"
     private static let didMigrateLegacyKey = "malangi.didMigrateLegacy"
-    private static let didClaimPeanutKey = "malangi.didClaimPeanut"
 
     static var registeredMalangis: [Malangi] {
         migrateLegacyRegistrationIfNeeded()
@@ -1388,55 +1456,30 @@ enum MalangiSettings {
             }
 
             saveRemoteMalangis(remoteMalangis)
-            claimDefaultAsLocalIfNeeded(name: "땅콩 크런치")
             notifyChanged()
         }
-    }
-
-    /// 특정 원격 기본 말랑이를 일회성으로 로컬 말랑이(remoteId=nil)로 복제하고 원격 기본은 숨깁니다.
-    /// 앱 첫 실행 후 원격 캐시가 채워진 뒤 1회만 수행됩니다 (didClaimPeanutKey 플래그).
-    private static func claimDefaultAsLocalIfNeeded(name: String) {
-        guard !UserDefaults.standard.bool(forKey: didClaimPeanutKey) else { return }
-        guard let target = remoteMalangis.first(where: { $0.name == name }),
-              let remoteId = target.remoteId else { return }
-
-        var local = storedMalangis
-        if !local.contains(where: { $0.name == name && $0.remoteId == nil }) {
-            let localCopy = StoredMalangi(
-                remoteId: nil,
-                name: target.name,
-                imagePath: target.imagePath,
-                imageFileName: target.imageFileName,
-                soundPaths: target.soundPaths,
-                soundFileNames: target.soundFileNames,
-                marketplaceId: nil
-            )
-            local.append(localCopy)
-            saveStoredMalangis(local)
-        }
-
-        var hidden = hiddenDefaults
-        hidden.insert(remoteId)
-        saveHiddenDefaults(hidden)
-
-        UserDefaults.standard.set(true, forKey: didClaimPeanutKey)
     }
 
     /// 로컬에 저장된 말랑이의 marketplaceId를 갱신합니다 (업로드/재업로드 후 호출).
     static func setMarketplaceId(_ id: String?, for malangi: StoredMalangi) {
         var stored = storedMalangis
-        guard let idx = localIndex(for: malangi, in: stored) else { return }
-        let existing = stored[idx]
-        stored[idx] = StoredMalangi(
-            remoteId: existing.remoteId,
-            name: existing.name,
-            imagePath: existing.imagePath,
-            imageFileName: existing.imageFileName,
-            soundPaths: existing.soundPaths,
-            soundFileNames: existing.soundFileNames,
-            marketplaceId: id
-        )
-        saveStoredMalangis(stored)
+        var didUpdate = false
+        for idx in stored.indices where sameLocalMalangi(stored[idx], malangi) {
+            let existing = stored[idx]
+            stored[idx] = StoredMalangi(
+                remoteId: existing.remoteId,
+                name: existing.name,
+                imagePath: existing.imagePath,
+                imageFileName: existing.imageFileName,
+                soundPaths: existing.soundPaths,
+                soundFileNames: existing.soundFileNames,
+                marketplaceId: id
+            )
+            didUpdate = true
+        }
+        if didUpdate {
+            saveStoredMalangis(stored)
+        }
     }
 
     private static func saveSounds(_ sourceDrafts: [SoundDraft], in registrationDirectory: URL) throws -> (paths: [String], fileNames: [String]) {
@@ -1529,7 +1572,12 @@ enum MalangiSettings {
             return []
         }
 
-        return (try? JSONDecoder().decode([StoredMalangi].self, from: data)) ?? []
+        let decoded = (try? JSONDecoder().decode([StoredMalangi].self, from: data)) ?? []
+        let normalized = normalizedMarketplaceIds(decoded)
+        if normalized.map(\.marketplaceId) != decoded.map(\.marketplaceId) {
+            saveStoredMalangis(normalized)
+        }
+        return normalized
     }
 
     private static var remoteMalangis: [StoredMalangi] {
@@ -1579,6 +1627,33 @@ enum MalangiSettings {
         return stored.firstIndex { $0.imagePath == malangi.imagePath }
     }
 
+    private static func sameLocalMalangi(_ lhs: StoredMalangi, _ rhs: StoredMalangi) -> Bool {
+        if lhs.imagePath == rhs.imagePath { return true }
+        return lhs.name == rhs.name && lhs.imageFileName == rhs.imageFileName
+    }
+
+    private static func normalizedMarketplaceIds(_ malangis: [StoredMalangi]) -> [StoredMalangi] {
+        malangis.map { malangi in
+            guard malangi.marketplaceId == nil,
+                  let inheritedId = malangis.first(where: {
+                      $0.marketplaceId != nil && sameLocalMalangi($0, malangi)
+                  })?.marketplaceId
+            else {
+                return malangi
+            }
+
+            return StoredMalangi(
+                remoteId: malangi.remoteId,
+                name: malangi.name,
+                imagePath: malangi.imagePath,
+                imageFileName: malangi.imageFileName,
+                soundPaths: malangi.soundPaths,
+                soundFileNames: malangi.soundFileNames,
+                marketplaceId: inheritedId
+            )
+        }
+    }
+
     private static func saveStoredMalangis(_ malangis: [StoredMalangi]) {
         let data = try? JSONEncoder().encode(malangis)
         UserDefaults.standard.set(data, forKey: registeredMalangisKey)
@@ -1587,6 +1662,10 @@ enum MalangiSettings {
     private static func saveRemoteMalangis(_ malangis: [StoredMalangi]) {
         let data = try? JSONEncoder().encode(malangis)
         UserDefaults.standard.set(data, forKey: remoteMalangisKey)
+    }
+
+    static func updateRemoteCatalog(_ malangis: [StoredMalangi]) {
+        saveRemoteMalangis(malangis)
     }
 
     private static var hiddenDefaults: Set<String> {
@@ -1678,7 +1757,7 @@ final class SettingsWindow: NSWindow {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 480),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 640),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false

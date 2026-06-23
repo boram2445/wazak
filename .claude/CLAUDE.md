@@ -51,6 +51,21 @@ swift run Wazak
 임시 에셋은 `Sources/Wazak/Resources/`에 있음 (`.process`로 번들에 포함).
 실제 에셋을 쓰려면 파일을 해당 경로에 추가하고 `main.swift`에서 `imageName` / `soundName`을 설정하세요.
 
+## 코드 수정 후 재시작
+
+코드 수정이 완료되면 반드시 다음 순서로 앱을 재시작하세요:
+
+1. 실행 중인 Wazak 프로세스 종료:
+   ```sh
+   pkill -x Wazak
+   ```
+2. 환경 변수 로드 후 재실행:
+   ```sh
+   set -a; source .env; set +a && swift run Wazak
+   ```
+
+`dev.sh`를 사용 중이라면 파일 저장 시 자동으로 재빌드+재실행되므로 별도 조치 불필요.
+
 ## 주의사항
 
 - **`.build/`가 git에 커밋되어 있음** — `.gitignore`에 없어서 빌드할 때마다 2,600개 이상의 파일이 diff에 잡힘. 정리하려면:
