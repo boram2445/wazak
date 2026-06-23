@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             self.configureStatusItem()
             MalangiSettings.refreshRemoteRegistrations()
+            MalangiSettings.syncBackupsFromServer()
             self.showOverlay()
         }
     }
@@ -90,6 +91,8 @@ struct StoredMalangi: Codable {
     var isDefault: Bool = false
     // marketplace_malangis row id — nil if not published yet
     var marketplaceId: String? = nil
+    // user_malangis client_key — nil if never backed up
+    var backupClientKey: String? = nil
 
     private enum CodingKeys: String, CodingKey {
         case remoteId
@@ -99,9 +102,10 @@ struct StoredMalangi: Codable {
         case soundPaths
         case soundFileNames
         case marketplaceId
+        case backupClientKey
     }
 
-    init(remoteId: String? = nil, name: String, imagePath: String, imageFileName: String? = nil, soundPaths: [String], soundFileNames: [String]? = nil, marketplaceId: String? = nil) {
+    init(remoteId: String? = nil, name: String, imagePath: String, imageFileName: String? = nil, soundPaths: [String], soundFileNames: [String]? = nil, marketplaceId: String? = nil, backupClientKey: String? = nil) {
         self.remoteId = remoteId
         self.name = name
         self.imagePath = imagePath
@@ -109,6 +113,7 @@ struct StoredMalangi: Codable {
         self.soundPaths = soundPaths
         self.soundFileNames = soundFileNames ?? soundPaths.map { ResourceLocator.displayName(for: $0) }
         self.marketplaceId = marketplaceId
+        self.backupClientKey = backupClientKey
     }
 
     init(from decoder: Decoder) throws {
@@ -121,6 +126,7 @@ struct StoredMalangi: Codable {
         soundFileNames = try container.decodeIfPresent([String].self, forKey: .soundFileNames)
             ?? soundPaths.map { ResourceLocator.displayName(for: $0) }
         marketplaceId = try container.decodeIfPresent(String.self, forKey: .marketplaceId)
+        backupClientKey = try container.decodeIfPresent(String.self, forKey: .backupClientKey)
     }
 
     func asMalangi() -> Malangi {
@@ -271,6 +277,50 @@ struct MarketplaceMalangiPayload: Codable {
         case soundURLs = "sound_urls"
         case soundFileNames = "sound_file_names"
         case isPublic = "is_public"
+    }
+}
+
+struct UserMalangi: Codable {
+    let id: String
+    let ownerId: String
+    let clientKey: String
+    let name: String
+    let imageURL: String
+    let imageFileName: String?
+    let soundURLs: [String]
+    let soundFileNames: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case ownerId = "owner_id"
+        case clientKey = "client_key"
+        case name
+        case imageURL = "image_url"
+        case imageFileName = "image_file_name"
+        case soundURLs = "sound_urls"
+        case soundFileNames = "sound_file_names"
+    }
+}
+
+struct UserMalangiPayload: Codable {
+    let ownerId: String
+    let clientKey: String
+    let name: String
+    let imageURL: String
+    let imageFileName: String?
+    let soundURLs: [String]
+    let soundFileNames: [String]
+    let updatedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case ownerId = "owner_id"
+        case clientKey = "client_key"
+        case name
+        case imageURL = "image_url"
+        case imageFileName = "image_file_name"
+        case soundURLs = "sound_urls"
+        case soundFileNames = "sound_file_names"
+        case updatedAt = "updated_at"
     }
 }
 
@@ -572,6 +622,74 @@ final class SupabaseMalangiClient {
         request.httpBody = try encoder.encode(Body(p_malangi_id: id))
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return try perform(request)
+    }
+
+    func fetchMyBackups(session: SupabaseAuthSession) throws -> [UserMalangi] {
+        guard isConfigured else { return [] }
+        var request = try makeRequest(path: "/rest/v1/user_malangis", queryItems: [
+            URLQueryItem(name: "select", value: "id,owner_id,client_key,name,image_url,image_file_name,sound_urls,sound_file_names"),
+            URLQueryItem(name: "owner_id", value: "eq.\(session.user.id)"),
+            URLQueryItem(name: "order", value: "created_at.asc")
+        ], accessToken: session.accessToken)
+        request.httpMethod = "GET"
+        return try perform(request)
+    }
+
+    func backupMalangi(_ malangi: StoredMalangi, clientKey: String, session: SupabaseAuthSession) throws -> UserMalangi {
+        guard isConfigured else {
+            throw NSError(domain: "Wazak", code: 23, userInfo: [NSLocalizedDescriptionKey: "Supabase 환경변수가 필요해요."])
+        }
+
+        let assetFolder = "backup/\(session.user.id)/\(clientKey)"
+        let imageURL = try marketplaceAssetURL(
+            reference: malangi.imagePath,
+            objectPath: "\(assetFolder)/image.png",
+            contentType: "image/png",
+            accessToken: session.accessToken
+        )
+        let soundURLs = try malangi.soundPaths.enumerated().map { index, path in
+            try marketplaceAssetURL(
+                reference: path,
+                objectPath: "\(assetFolder)/sounds/sound-\(index + 1).\(soundExtension(for: path))",
+                contentType: contentType(for: path),
+                accessToken: session.accessToken
+            )
+        }
+
+        let formatter = ISO8601DateFormatter()
+        let payload = UserMalangiPayload(
+            ownerId: session.user.id,
+            clientKey: clientKey,
+            name: malangi.name,
+            imageURL: imageURL,
+            imageFileName: malangi.imageFileName,
+            soundURLs: soundURLs,
+            soundFileNames: malangi.soundFileNames,
+            updatedAt: formatter.string(from: Date())
+        )
+
+        let selectQuery = URLQueryItem(name: "select", value: "id,owner_id,client_key,name,image_url,image_file_name,sound_urls,sound_file_names")
+        var request = try makeRequest(path: "/rest/v1/user_malangis", queryItems: [selectQuery], accessToken: session.accessToken)
+        request.httpMethod = "POST"
+        request.httpBody = try encoder.encode(payload)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("return=representation, resolution=merge-duplicates", forHTTPHeaderField: "Prefer")
+
+        let rows: [UserMalangi] = try perform(request)
+        guard let row = rows.first else {
+            throw NSError(domain: "Wazak", code: 24, userInfo: [NSLocalizedDescriptionKey: "백업 결과를 확인할 수 없어요."])
+        }
+        return row
+    }
+
+    func deleteBackup(clientKey: String, session: SupabaseAuthSession) throws {
+        guard isConfigured else { return }
+        var request = try makeRequest(path: "/rest/v1/user_malangis", queryItems: [
+            URLQueryItem(name: "owner_id", value: "eq.\(session.user.id)"),
+            URLQueryItem(name: "client_key", value: "eq.\(clientKey)")
+        ], accessToken: session.accessToken)
+        request.httpMethod = "DELETE"
+        _ = try performRaw(request)
     }
 
     func unpublishMarketplaceMalangi(id: String, session: SupabaseAuthSession) throws {
@@ -1353,6 +1471,7 @@ enum MalangiSettings {
         }
 
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let backupClientKey = existing?.backupClientKey ?? UUID().uuidString
         let storedMalangi = StoredMalangi(
             remoteId: existing?.remoteId,
             name: trimmedName.isEmpty ? "말랑이 \(stored.count + 1)" : trimmedName,
@@ -1360,7 +1479,8 @@ enum MalangiSettings {
             imageFileName: imageFileName,
             soundPaths: soundPaths,
             soundFileNames: soundFileNames,
-            marketplaceId: existing?.marketplaceId
+            marketplaceId: existing?.marketplaceId,
+            backupClientKey: backupClientKey
         )
 
         if let localIndex = localIndex(for: existing, in: stored) {
@@ -1437,6 +1557,34 @@ enum MalangiSettings {
         }
     }
 
+    static func syncBackupsFromServer() {
+        guard let session = SupabaseMalangiClient.shared.authSession else { return }
+        DispatchQueue.global(qos: .utility).async {
+            guard let backups = try? SupabaseMalangiClient.shared.fetchMyBackups(session: session) else { return }
+            var stored = storedMalangis
+            var didAdd = false
+            for backup in backups {
+                let alreadyExists = stored.contains {
+                    $0.backupClientKey == backup.clientKey || (!$0.isDefault && $0.name == backup.name)
+                }
+                guard !alreadyExists else { continue }
+                stored.append(StoredMalangi(
+                    name: backup.name,
+                    imagePath: backup.imageURL,
+                    imageFileName: backup.imageFileName,
+                    soundPaths: backup.soundURLs,
+                    soundFileNames: backup.soundFileNames,
+                    backupClientKey: backup.clientKey
+                ))
+                didAdd = true
+            }
+            if didAdd {
+                saveStoredMalangis(stored)
+                notifyChanged()
+            }
+        }
+    }
+
     /// 로컬에 저장된 말랑이의 marketplaceId를 갱신합니다 (업로드/재업로드 후 호출).
     static func setMarketplaceId(_ id: String?, for malangi: StoredMalangi) {
         var stored = storedMalangis
@@ -1450,7 +1598,8 @@ enum MalangiSettings {
                 imageFileName: existing.imageFileName,
                 soundPaths: existing.soundPaths,
                 soundFileNames: existing.soundFileNames,
-                marketplaceId: id
+                marketplaceId: id,
+                backupClientKey: existing.backupClientKey
             )
             didUpdate = true
         }

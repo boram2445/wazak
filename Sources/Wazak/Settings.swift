@@ -188,7 +188,9 @@ final class SettingsViewModel: ObservableObject {
 
     func deleteRegistration() {
         guard let idx = selectedIndex, registrations.indices.contains(idx) else { return }
-        let name = registrations[idx].name
+        let reg = registrations[idx]
+        let name = reg.name
+        let backupClientKey = reg.backupClientKey
         alert = SettingsAlert(
             title: "정말 삭제할까요?",
             detail: "\(name)을(를) 삭제하면 되돌릴 수 없어요.",
@@ -199,6 +201,13 @@ final class SettingsViewModel: ObservableObject {
                     try MalangiSettings.deleteMalangi(at: idx)
                     self.clearDraft()
                     self.reload()
+                    // 서버 백업도 삭제 (best-effort)
+                    if let clientKey = backupClientKey,
+                       let session = SupabaseMalangiClient.shared.authSession {
+                        DispatchQueue.global(qos: .background).async {
+                            try? SupabaseMalangiClient.shared.deleteBackup(clientKey: clientKey, session: session)
+                        }
+                    }
                 } catch {
                     self.alert = SettingsAlert(title: "삭제에 실패했어요.", detail: error.localizedDescription)
                 }
@@ -265,7 +274,14 @@ final class SettingsViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.isSaving = false
                 switch result {
-                case .success:
+                case .success(let saved):
+                    // 로그인 상태면 백그라운드로 서버 백업 (best-effort)
+                    if let session = SupabaseMalangiClient.shared.authSession,
+                       let clientKey = saved.backupClientKey {
+                        DispatchQueue.global(qos: .background).async {
+                            _ = try? SupabaseMalangiClient.shared.backupMalangi(saved, clientKey: clientKey, session: session)
+                        }
+                    }
                     self.clearDraft()
                     self.reload()
                     self.onRequestClose?()
@@ -576,6 +592,7 @@ final class SettingsViewModel: ObservableObject {
         authStatusText = ""
         reload()
         refreshPoints()     // 로그인 직후 잔액 표시
+        MalangiSettings.syncBackupsFromServer()   // 이 계정의 백업 말랑이 복구
         if pendingUpload {
             pendingUpload = false
             upload()
